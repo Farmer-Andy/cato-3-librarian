@@ -1,0 +1,24 @@
+# Dependencies & build output
+node_modules/
+dist/
+
+# Wrangler / Cloudflare local state
+.wrangler/
+
+# Secrets — never commit
+.dev.vars
+.env
+.env.*
+
+# OS / editor cruft
+.DS_Store
+
+# Local agent/editor config
+.claude/
+
+# Internal session history & staging reminders — not part of the public template
+CLAUDE.md
+READ-FIRST.md
+PROMOTION_LOG.md
+devlog-*.md
+docs/

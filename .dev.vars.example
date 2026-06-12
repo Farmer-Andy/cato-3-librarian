@@ -1,0 +1,9 @@
+# Copy to `.dev.vars` (gitignored) and fill in for local `wrangler dev`.
+# For production, set each one with: npx wrangler secret put <NAME>
+#
+# OpenRouter API key — https://openrouter.ai/keys
+OPENROUTER_API_KEY=
+# Telegram bot token from @BotFather
+TELEGRAM_BOT_TOKEN=
+# Your numeric Telegram user ID (from @userinfobot). MUST be a secret, not a [vars] entry.
+ADMIN_TELEGRAM_ID=
