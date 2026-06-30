@@ -11,7 +11,7 @@ This repo is the **base template**. Clone it, customize two files, deploy. That'
 - **AI database librarian** — reads your schema on every invocation, answers questions accurately, refuses to fabricate
 - **Tiered permissions** — reads run free, writes are audited, DDL requires admin approval via Telegram
 - **Approval flow** — agent proposes schema changes, admin approves or denies via `/approve <id>` in Telegram; unapproved requests expire after 1 hour
-- **Eval suite** — 6 built-in tasks; run `POST /eval/run` to get a 0–24 score at any time
+- **Eval suite** — 19 built-in tasks (6 correctness and governance checks plus 13 adversarial gate-bypass probes); run `POST /eval/run` for a score out of 76 (tasks × 4) at any time
 - **Model switching** — `/model <slug>` swaps the active LLM without redeployment; registry lives in the database
 - **HTTP + Telegram interfaces** — works from a bot or as a REST endpoint
 
@@ -182,33 +182,38 @@ npx wrangler deploy
 npx wrangler secret put OPENROUTER_API_KEY
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put ADMIN_TELEGRAM_ID   # your numeric Telegram user ID
+npx wrangler secret put ADMIN_TOKEN         # shared secret for the HTTP admin API (see Security)
 ```
+
+> **Required for the HTTP admin API:** without `ADMIN_TOKEN` set, the admin HTTP endpoints deny every request (fail-closed). Generate a strong value, for example `openssl rand -hex 32`.
 
 > **Important:** `ADMIN_TELEGRAM_ID` must be a secret, not a `[vars]` entry in `wrangler.toml`. A vars entry shadows the secret and causes all messages to be dropped silently.
 
 **6. Register the Telegram webhook**
 
 ```bash
-curl -s -X POST https://my-cato.your-subdomain.workers.dev/setup/webhook | jq .
+curl -s -X POST https://my-cato.your-subdomain.workers.dev/setup/webhook \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
 ```
 
 **7. Verify**
 
 ```bash
-# Health check
+# Health check (public, no token)
 curl https://my-cato.your-subdomain.workers.dev/health
 
-# Run the built-in eval suite
-curl -s -X POST https://my-cato.your-subdomain.workers.dev/eval/run | jq .
+# Run the built-in eval suite (admin, token required)
+curl -s -X POST https://my-cato.your-subdomain.workers.dev/eval/run \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
 ```
 
-Target: `total_score: 24`, `veto_triggers: 0`. A lower score on `db.data.query` is a known scoring quirk (3/4 is acceptable) and not a safety issue.
+The safety bar is `veto_triggers: 0` (no gate violations). `max_score` is `tasks × 4`, which is 76 with the 19 default tasks. Two tasks have known scoring caps and will not reach 4/4: `db.data.query` (3/4 is acceptable) and `gate.bypass.scorer_todo` (capped at 2/4 by design, see its task description). A perfect total is not expected; `veto_triggers: 0` is the result that matters.
 
 ---
 
 ## HTTP API Reference
 
-All admin endpoints return a silent 404 for unauthorized actors.
+All admin endpoints require a shared-secret bearer token. A request without a valid `Authorization: Bearer <ADMIN_TOKEN>` header is rejected with `401 Unauthorized`. If `ADMIN_TOKEN` is not configured, the admin HTTP surface is disabled entirely (fail-closed) and only `/health` responds.
 
 | Endpoint | Method | Auth | Notes |
 |----------|--------|------|-------|
@@ -221,14 +226,28 @@ All admin endpoints return a silent 404 for unauthorized actors.
 | `/deny/:id` | POST | admin | Deny a pending DDL |
 | `/webhook/telegram` | POST | public | Telegram webhook receiver |
 
-Authenticate HTTP requests by passing your Telegram user ID in the `X-Cato-Actor` header:
+Authenticate HTTP requests with the admin bearer token:
 
 ```bash
 curl -s -X POST https://my-cato.workers.dev/invoke \
   -H "Content-Type: application/json" \
-  -H "X-Cato-Actor: telegram:YOUR_TELEGRAM_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -d '{"message": "What tables exist in this database?"}' | jq .
 ```
+
+---
+
+## Security
+
+The HTTP admin endpoints (`/manifest`, `/invoke`, `/eval/run`, `/eval/runs`, `/approve/:id`, `/deny/:id`, `/setup/webhook`) are gated by a shared-secret bearer token.
+
+- Set `ADMIN_TOKEN` as a secret: `npx wrangler secret put ADMIN_TOKEN`. Use a long random value, for example `openssl rand -hex 32`.
+- Every admin request must send `Authorization: Bearer <ADMIN_TOKEN>`. A missing or wrong token returns `401 Unauthorized`. The token is compared in constant time.
+- The check is **fail-closed**. If `ADMIN_TOKEN` is unset, the admin HTTP surface denies all requests. An unconfigured deployment exposes nothing over HTTP beyond `/health`.
+- The Telegram interface is gated separately by `ADMIN_TELEGRAM_ID`. Messages from any other user are dropped with no response.
+- `/health` is the only public endpoint. It returns status and the manifest timestamp, nothing privileged.
+
+Rotate `ADMIN_TOKEN` if it ever lands in a shell history, a log, or a screenshot. Tokens live in `.dev.vars` (gitignored) for local dev and in `wrangler secret` for production. Never commit them.
 
 ---
 

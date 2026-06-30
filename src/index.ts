@@ -36,6 +36,31 @@ function resolveActorFromTelegram(body: TelegramUpdate, env: Env): Actor {
   return { id, role };
 }
 
+// Length-independent equality on the matched bytes, to avoid leaking the token
+// through response timing on a per-character compare.
+function timingSafeEqual(a: string, b: string): boolean {
+  const aBytes = new TextEncoder().encode(a);
+  const bBytes = new TextEncoder().encode(b);
+  if (aBytes.length !== bBytes.length) return false;
+  let diff = 0;
+  for (let i = 0; i < aBytes.length; i++) {
+    diff |= aBytes[i] ^ bBytes[i];
+  }
+  return diff === 0;
+}
+
+// Admin HTTP auth: a shared-secret bearer token checked against env.ADMIN_TOKEN.
+// Fail-closed: if ADMIN_TOKEN is unset, no request can authenticate, so the
+// admin surface stays closed rather than opening up.
+function isAuthorizedAdmin(request: Request, env: Env): boolean {
+  const expected = env.ADMIN_TOKEN;
+  if (!expected) return false;
+  const header = request.headers.get('Authorization') ?? '';
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match) return false;
+  return timingSafeEqual(match[1], expected);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -76,10 +101,23 @@ export default {
       return agent.fetch(forwarded);
     }
 
-    // Admin-only HTTP endpoints — actor resolved from headers (future: auth middleware)
-    // For Checkpoint 1, admin is identified by a simple bearer token matching ADMIN_TELEGRAM_ID
-    // or by the request originating from a known context.
-    // For now: allow all to admin endpoints so we can test via curl; lock down in production.
+    // Admin-only HTTP surface: privileged read / exec / mutate endpoints.
+    // Auth is a shared-secret bearer token: `Authorization: Bearer <ADMIN_TOKEN>`.
+    // Fail-closed: if env.ADMIN_TOKEN is unset, every admin route denies with 401.
+    // An unconfigured deployment exposes nothing here beyond /health.
+    const approvePath = url.pathname.match(/^\/(approve|deny)\/(.+)$/);
+    const isAdminRoute =
+      (request.method === 'GET' && url.pathname === '/manifest') ||
+      (request.method === 'POST' && url.pathname === '/invoke') ||
+      (request.method === 'POST' && url.pathname === '/eval/run') ||
+      (request.method === 'GET' && url.pathname === '/eval/runs') ||
+      (request.method === 'POST' && url.pathname === '/setup/webhook') ||
+      (request.method === 'POST' && approvePath !== null);
+
+    if (isAdminRoute && !isAuthorizedAdmin(request, env)) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+
     const adminActor: Actor = { id: 'http:admin', role: 'admin' };
 
     if (request.method === 'GET' && url.pathname === '/manifest') {
@@ -111,7 +149,6 @@ export default {
     }
 
     // /approve/:id and /deny/:id
-    const approvePath = url.pathname.match(/^\/(approve|deny)\/(.+)$/);
     if (request.method === 'POST' && approvePath) {
       return forwardToAgent(agent, url.pathname, request, {
         'X-Cato-Actor': adminActor.id,

@@ -3,6 +3,7 @@ export interface Env {
   OPENROUTER_API_KEY: string;
   TELEGRAM_BOT_TOKEN: string;
   ADMIN_TELEGRAM_ID: string;
+  ADMIN_TOKEN: string;
 }
 
 export interface Actor {

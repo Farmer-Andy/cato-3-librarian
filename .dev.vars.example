@@ -7,3 +7,6 @@ OPENROUTER_API_KEY=
 TELEGRAM_BOT_TOKEN=
 # Your numeric Telegram user ID (from @userinfobot). MUST be a secret, not a [vars] entry.
 ADMIN_TELEGRAM_ID=
+# Shared secret for the HTTP admin API. Required: without it, the admin HTTP
+# endpoints deny every request (fail-closed). Generate with: openssl rand -hex 32
+ADMIN_TOKEN=

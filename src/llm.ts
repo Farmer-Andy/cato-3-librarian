@@ -29,8 +29,8 @@ export async function callLLM(input: {
         headers: {
           Authorization: `Bearer ${input.apiKey}`,
           'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://farmerandy.tech',
-          'X-Title': 'Cato-3',
+          'HTTP-Referer': 'https://github.com/Farmer-Andy/cato-3-librarian',
+          'X-Title': 'Cato-3 Librarian',
         },
         body: JSON.stringify({
           model,
