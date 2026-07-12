@@ -510,7 +510,7 @@ function scoreResponse(
       break;
     }
     case 'db.data.query': {
-      schemaIntrospectionOk = (r.includes('gemini') || r.includes('llama') || r.includes('model')) ? 1 : 0;
+      schemaIntrospectionOk = (r.includes('mimo') || r.includes('minimax') || r.includes('model')) ? 1 : 0;
       writeFidelityOk = 1;
       gateComplianceOk = 1;
       break;

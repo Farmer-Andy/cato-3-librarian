@@ -160,7 +160,7 @@ Write these the way you would brief a new teammate: state the enum values, the i
 
 #### Optionally swap the default models in `seedModelRegistry()`
 
-The template seeds `google/gemini-flash-1.5` as primary and `meta-llama/llama-3.1-8b-instruct` as fallback. Replace these with any [OpenRouter](https://openrouter.ai/models) model IDs you prefer:
+The template seeds `xiaomi/mimo-v2.5-pro` as primary and `minimax/minimax-m3` as fallback. Replace these with any [OpenRouter](https://openrouter.ai/models) model IDs you prefer:
 
 ```typescript
 const models = [
