@@ -22,7 +22,8 @@ export async function callLLM(input: {
   for (const model of models) {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 25000);
+      // 60s: reasoning-tier default models (e.g. xiaomi/mimo-v2.5-pro) run long on tool turns; was 25s.
+      const timeoutId = setTimeout(() => controller.abort(), 60000);
 
       const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
