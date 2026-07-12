@@ -12,7 +12,8 @@ bindings = [
 tag = "v1"
 new_sqlite_classes = ["CatoAgent"]
 
-# Secrets managed via Cloudflare dashboard or `wrangler secret put`:
-# OPENROUTER_API_KEY  ✅
-# TELEGRAM_BOT_TOKEN  ⏳
-# ADMIN_TELEGRAM_ID   ✅
+# Secrets (set each with `wrangler secret put <NAME>`, or in the Cloudflare dashboard):
+#   OPENROUTER_API_KEY   OpenRouter API key
+#   TELEGRAM_BOT_TOKEN   Telegram bot token from @BotFather
+#   ADMIN_TELEGRAM_ID    your numeric Telegram user ID
+#   ADMIN_TOKEN          shared secret for the HTTP admin API (fail-closed if unset)
