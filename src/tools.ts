@@ -13,16 +13,53 @@ export function classifySQL(sql: string): SQLClass {
   if (!firstKeyword) return 'unknown';
   if (DDL_KEYWORDS.has(firstKeyword)) return 'ddl';
   if (WRITE_KEYWORDS.has(firstKeyword)) return 'write';
+  // A WITH clause can prefix INSERT/UPDATE/DELETE as well as SELECT — classifying
+  // it as read by first keyword alone let CTE-wrapped mutations through the
+  // read-only query tool. Classify by the top-level statement verb instead.
+  if (firstKeyword === 'WITH') return classifyCTE(stripped);
+  // Assignment-form pragmas (PRAGMA writable_schema = ON, PRAGMA user_version = 7)
+  // mutate state; only the bare/function forms are reads.
+  if (firstKeyword === 'PRAGMA') return isPragmaAssignment(stripped) ? 'unknown' : 'read';
   if (READ_KEYWORDS.has(firstKeyword)) return 'read';
   return 'unknown';
+}
+
+// Find the first paren-depth-0 statement verb after the CTE definitions.
+// CTE bodies live inside parentheses, so the first top-level write/select
+// keyword is the statement the CTE feeds.
+function classifyCTE(stripped: string): SQLClass {
+  let depth = 0;
+  let sawWith = false;
+  const re = /[()]|[A-Za-z_]+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stripped)) !== null) {
+    const tok = m[0];
+    if (tok === '(') { depth += 1; continue; }
+    if (tok === ')') { depth -= 1; continue; }
+    if (depth !== 0) continue;
+    const kw = tok.toUpperCase();
+    if (!sawWith) {
+      if (kw === 'WITH') sawWith = true;
+      continue;
+    }
+    if (WRITE_KEYWORDS.has(kw)) return 'write';
+    if (kw === 'SELECT' || kw === 'VALUES') return 'read';
+  }
+  return 'unknown';
+}
+
+function isPragmaAssignment(stripped: string): boolean {
+  return /^\s*PRAGMA\s+[A-Za-z_.]+\s*=/i.test(stripped);
 }
 
 export function isUnsafeWrite(sql: string): boolean {
   const stripped = stripCommentsAndStrings(sql).toUpperCase();
   const firstKeyword = extractFirstKeyword(stripped);
   if (firstKeyword !== 'DELETE' && firstKeyword !== 'UPDATE') return false;
-  // Check for presence of WHERE clause
-  return !stripped.includes('WHERE');
+  // Token check, not substring: identifiers like SOMEWHERE must not satisfy the guard.
+  // Known residual gap (shared with phase-2): a tautological clause like
+  // WHERE id = id still counts as constrained. Structural analysis is out of scope.
+  return !/\bWHERE\b/.test(stripped);
 }
 
 function extractFirstKeyword(sql: string): string {
