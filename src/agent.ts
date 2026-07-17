@@ -65,6 +65,20 @@ export class CatoAgent {
     );
   }
 
+  // Approved-DDL execution. The cursor MUST be consumed (.toArray()) before the
+  // approval is marked granted: DO SQLite cursors are lazy, and in production an
+  // unconsumed DDL cursor may never execute even though the approval would have
+  // been recorded, logged, and reported to the admin as applied.
+  private executeApprovedDDL(ddl: string, id: string, actor: Actor): void {
+    try {
+      this.sql.exec(ddl).toArray();
+    } catch (err) {
+      this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'ddl_execute', payload: { id, sql: ddl }, outcome: 'failure', errorMessage: String(err) });
+      throw err;
+    }
+    this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'ddl_execute', payload: { id, sql: ddl }, outcome: 'success' });
+  }
+
   private async executeTool(toolName: string, args: Record<string, unknown>, actor: Actor): Promise<string> {
     switch (toolName) {
       case 'query': {
@@ -261,11 +275,9 @@ export class CatoAgent {
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'approval_deny', payload: { id: approveMatch[1] }, outcome: 'failure', errorMessage: 'Not admin' });
           return Response.json({ ok: true });
         }
-        const result = processApproval(this.sql, approveMatch[1], 'granted', actor.id, (sql) => {
-          this.sql.exec(sql);
-          this.ctx.waitUntil(this.refreshManifest());
-          this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'ddl_execute', payload: { id: approveMatch[1], sql }, outcome: 'success' });
-        });
+        const result = processApproval(this.sql, approveMatch[1], 'granted', actor.id, (sql) =>
+          this.executeApprovedDDL(sql, approveMatch[1], actor)
+        );
         if (result.ok) {
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'approval_grant', payload: { id: approveMatch[1] }, outcome: 'success' });
           await this.refreshManifest();
@@ -367,11 +379,9 @@ export class CatoAgent {
       if (actor.role !== 'admin') return new Response(null, { status: 404 });
       const action = approvePathMatch[1] as 'approve' | 'deny';
       const id = approvePathMatch[2];
-      const result = processApproval(this.sql, id, action === 'approve' ? 'granted' : 'denied', actor.id, (sql) => {
-        this.sql.exec(sql);
-        this.ctx.waitUntil(this.refreshManifest());
-        this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'ddl_execute', payload: { id, sql }, outcome: 'success' });
-      });
+      const result = processApproval(this.sql, id, action === 'approve' ? 'granted' : 'denied', actor.id, (sql) =>
+        this.executeApprovedDDL(sql, id, actor)
+      );
       if (result.ok && action === 'approve') {
         this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'approval_grant', payload: { id }, outcome: 'success' });
         await this.refreshManifest();
