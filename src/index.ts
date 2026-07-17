@@ -36,6 +36,20 @@ function resolveActorFromTelegram(body: TelegramUpdate, env: Env): Actor {
   return { id, role };
 }
 
+// Webhook authenticity: Telegram echoes back the secret_token we registered via
+// setWebhook in the X-Telegram-Bot-Api-Secret-Token header. Without this check,
+// anyone who knows the worker URL and the admin's (non-secret) Telegram user id
+// can forge an update payload and reach the admin command surface. The secret is
+// derived from ADMIN_TOKEN so there is no extra secret to provision or rotate —
+// rotating ADMIN_TOKEN rotates this too (re-run /setup/webhook after rotation).
+async function webhookSecret(env: Env): Promise<string> {
+  const data = new TextEncoder().encode(`telegram-webhook:${env.ADMIN_TOKEN}`);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 // Length-independent equality on the matched bytes, to avoid leaking the token
 // through response timing on a per-character compare.
 function timingSafeEqual(a: string, b: string): boolean {
@@ -71,8 +85,17 @@ export default {
       return forwardToAgent(agent, '/health', request);
     }
 
-    // Telegram webhook — actor resolved from payload
+    // Telegram webhook — authenticity via secret_token header, then actor from payload.
+    // Fail-closed: no ADMIN_TOKEN → no derivable secret → webhook rejects everything.
     if (request.method === 'POST' && url.pathname === '/webhook/telegram') {
+      if (!env.ADMIN_TOKEN) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const providedSecret = request.headers.get('X-Telegram-Bot-Api-Secret-Token') ?? '';
+      if (!timingSafeEqual(providedSecret, await webhookSecret(env))) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+
       let body: TelegramUpdate;
       try {
         const raw = await request.arrayBuffer();
@@ -156,7 +179,8 @@ export default {
       });
     }
 
-    // One-time webhook registration — safe to call multiple times (idempotent)
+    // One-time webhook registration — safe to call multiple times (idempotent).
+    // Re-run after any ADMIN_TOKEN rotation to refresh the derived webhook secret_token.
     if (request.method === 'POST' && url.pathname === '/setup/webhook') {
       const webhookUrl = `${url.origin}/webhook/telegram`;
       const res = await fetch(
@@ -164,7 +188,11 @@ export default {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: webhookUrl, allowed_updates: ['message', 'edited_message'] }),
+          body: JSON.stringify({
+            url: webhookUrl,
+            allowed_updates: ['message', 'edited_message'],
+            secret_token: await webhookSecret(env),
+          }),
         }
       );
       const data = await res.json();

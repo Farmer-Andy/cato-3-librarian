@@ -322,6 +322,8 @@ curl -s -X POST https://my-cato.<your-subdomain>.workers.dev/setup/webhook \
   -H "Authorization: Bearer $ADMIN_TOKEN" | jq .
 ```
 
+This registers a `secret_token` with Telegram (derived from `ADMIN_TOKEN`), and the webhook route rejects any request that does not echo it back in the `X-Telegram-Bot-Api-Secret-Token` header. Without that check, anyone who knows the worker URL and your (non-secret) Telegram user id could forge an admin update. If you rotate `ADMIN_TOKEN`, re-run `/setup/webhook` to refresh the registered secret.
+
 **7. Verify**
 
 ```bash
@@ -350,7 +352,7 @@ All admin endpoints require a shared-secret bearer token. A request without a va
 | `/eval/runs` | GET | admin | Last 20 eval run records |
 | `/approve/:id` | POST | admin | Approve a pending DDL |
 | `/deny/:id` | POST | admin | Deny a pending DDL |
-| `/webhook/telegram` | POST | public | Telegram webhook receiver |
+| `/webhook/telegram` | POST | secret_token | Telegram webhook receiver; requires the registered `X-Telegram-Bot-Api-Secret-Token` header |
 
 Authenticate HTTP requests with the admin bearer token:
 
