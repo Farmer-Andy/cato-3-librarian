@@ -178,7 +178,7 @@ describe('telegram inbox alarm drain', () => {
     const poisonId = 840001;
 
     // Model outage: every LLM round throws, so processing the update throws too.
-    stubOutbound({ llmThrows: true });
+    const poisonCalls = stubOutbound({ llmThrows: true });
     await enqueue(name, regularBody(poisonId, 'trigger the model'), { clearEventLog: true });
 
     // Run 1: attempts = 1, still pending.
@@ -205,6 +205,14 @@ describe('telegram inbox alarm drain', () => {
     );
     expect(failed).toHaveLength(1);
 
+    // Quarantine notice: the user is told their command was dropped, exactly once,
+    // on the attempt that marked the row failed (not on the earlier retries).
+    const quarantineNotices = poisonCalls.filter(
+      (c) => c.url.includes('sendMessage') && String(c.body['text']).includes('failed after 3 attempts'),
+    );
+    expect(quarantineNotices).toHaveLength(1);
+    expect(Number(quarantineNotices[0].body['chat_id'])).toBe(Number(env.ADMIN_TELEGRAM_ID));
+
     // A later, healthy update still gets processed — the poison did not block the queue.
     vi.unstubAllGlobals();
     const healthyCalls = stubOutbound({ llm: [{ content: 'healthy reply' }] });
@@ -213,5 +221,70 @@ describe('telegram inbox alarm drain', () => {
     await drainOnce(name);
     expect((await readRow(name, healthyId))['status']).toBe('done');
     expect(healthyCalls.some((c) => c.url.includes('sendMessage'))).toBe(true);
+  });
+
+  it('reschedules immediately (not +30s) when a fresh update arrives mid-drain', async () => {
+    const name = 'inbox-fresh-reschedule';
+    const firstId = 850001;
+    const secondId = 850002;
+    const telegramCalls: TelegramCall[] = [];
+    let injected = false;
+
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName(name));
+    await runInDurableObject(stub, async (instance: CatoAgent, state: DurableObjectState) => {
+      await (instance as unknown as AgentInternals).initialize();
+      state.storage.sql.exec('DELETE FROM telegram_updates').toArray();
+
+      // Stub outbound. While the FIRST update's LLM round is in flight, inject a
+      // second, fresh (attempts = 0) update straight into the inbox — the input
+      // gate is open during this await, exactly as a real webhook enqueue would
+      // be. That row is not in processInbox's snapshot, so it survives the drain
+      // and must trigger an IMMEDIATE reschedule, not the 30s retry backoff.
+      vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.startsWith('https://api.telegram.org/')) {
+          const raw = init?.body ? String(init.body) : await (input as Request).clone().text();
+          telegramCalls.push({ url, body: JSON.parse(raw) as Record<string, unknown> });
+          return Response.json({ ok: true, result: true });
+        }
+        if (url.startsWith('https://openrouter.ai/')) {
+          if (!injected) {
+            injected = true;
+            state.storage.sql.exec(
+              `INSERT OR IGNORE INTO telegram_updates (update_id, chat_id, text, payload) VALUES (?, ?, ?, ?)`,
+              secondId,
+              Number(env.ADMIN_TELEGRAM_ID),
+              'second',
+              regularBody(secondId, 'second')
+            ).toArray();
+          }
+          return Response.json({ choices: [{ message: { content: 'first answer' } }] });
+        }
+        throw new Error(`Unexpected outbound fetch in test: ${url}`);
+      });
+
+      // Enqueue the first update, drop the alarm it armed, then drive one alarm pass.
+      const res = await instance.fetch(telegramRequest(regularBody(firstId, 'first')));
+      expect(res.status).toBe(200);
+      await state.storage.deleteAlarm();
+
+      await (instance as unknown as AgentAlarm).alarm();
+
+      // The fresh second row is pending after the drain, so the reschedule is
+      // immediate: getAlarm() is at or before now, not ~30s out. Read and clear
+      // the alarm before the block yields, so the harness cannot auto-fire the
+      // now-alarm and race the assertions.
+      const alarmAt = await state.storage.getAlarm();
+      await state.storage.deleteAlarm();
+      expect(alarmAt).not.toBeNull();
+      expect(alarmAt as number).toBeLessThanOrEqual(Date.now());
+
+      const secondRow = state.storage.sql
+        .exec('SELECT status, attempts FROM telegram_updates WHERE update_id = ?', secondId)
+        .toArray()[0] as Record<string, unknown>;
+      expect(secondRow['status']).toBe('pending');
+      expect(Number(secondRow['attempts'])).toBe(0);
+    });
+    vi.unstubAllGlobals();
   });
 });

@@ -392,7 +392,7 @@ export class CatoAgent {
   // Drain the Telegram inbox: process every pending row, oldest update_id first.
   private async processInbox(): Promise<void> {
     const rows = this.sql.exec(
-      `SELECT update_id, payload FROM telegram_updates WHERE status = 'pending' ORDER BY update_id`
+      `SELECT update_id, chat_id, payload FROM telegram_updates WHERE status = 'pending' ORDER BY update_id`
     ).toArray() as Array<Record<string, unknown>>;
 
     for (const row of rows) {
@@ -446,6 +446,22 @@ export class CatoAgent {
             outcome: 'failure',
             errorMessage: String(err),
           });
+          // Tell the user their command was dropped instead of letting it vanish
+          // silently. Best-effort and wrapped in its OWN try/catch: a Telegram API
+          // failure here must never throw out of the alarm loop. This code runs
+          // inside the per-row catch, which is not itself guarded, so an unhandled
+          // throw would escape processInbox and alarm() (see the per-row catch
+          // comment above on why alarm() must never throw).
+          const chatId = row['chat_id'];
+          if (chatId !== null && chatId !== undefined) {
+            try {
+              await sendTelegramMessage(
+                this.env.TELEGRAM_BOT_TOKEN,
+                Number(chatId),
+                'Sorry, processing this message failed after 3 attempts. It has been logged for the operator.'
+              );
+            } catch { /* swallow: a notify failure must not break the alarm */ }
+          }
         }
         // attempts < 3: leave pending; the alarm reschedules a retry. A poison row
         // never blocks later rows — the loop continues to the next update.
@@ -473,14 +489,24 @@ export class CatoAgent {
     // Drain the inbox.
     await this.processInbox();
 
-    // Reschedule. Inbox rows still pending (attempts < 3) → retry in 30s. Pending
-    // approvals → keep the 1h TTL sweep. One alarm slot, so wake at the earlier time.
+    // Reschedule the inbox wake. A row with attempts = 0 is a FRESH arrival: it
+    // was enqueued after processInbox took its snapshot (the input gate is open
+    // during the LLM awaits, so a webhook can insert mid-drain), so it was never
+    // tried and must be processed immediately, not after the 30s retry backoff.
+    // Rows that have all been tried at least once are genuine retries and wait
+    // 30s. Pending approvals keep the 1h TTL sweep; one alarm slot, so wake at the
+    // earlier time.
     let next: number | null = null;
     const pendingInbox = this.sql.exec(
-      `SELECT COUNT(*) AS n FROM telegram_updates WHERE status = 'pending' AND attempts < 3`
+      `SELECT COUNT(*) AS n, COALESCE(MIN(attempts), 0) AS min_attempts
+       FROM telegram_updates WHERE status = 'pending' AND attempts < 3`
     ).toArray();
-    const inboxCount = pendingInbox.length > 0 ? Number((pendingInbox[0] as Record<string, unknown>)['n']) : 0;
-    if (inboxCount > 0) next = Date.now() + 30_000;
+    const inboxRow = (pendingInbox[0] ?? {}) as Record<string, unknown>;
+    const inboxCount = Number(inboxRow['n'] ?? 0);
+    if (inboxCount > 0) {
+      const minAttempts = Number(inboxRow['min_attempts'] ?? 0);
+      next = minAttempts === 0 ? Date.now() : Date.now() + 30_000;
+    }
 
     const pendingApprovals = this.sql.exec(
       `SELECT COUNT(*) AS n FROM approval_pending WHERE status = 'pending'`
