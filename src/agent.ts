@@ -1,7 +1,7 @@
 import type { Env, Actor, LLMMessage } from './types';
 import { initSchema, populateMetaComments, seedModelRegistry, seedEvalTasks, generateSchemaManifest, getActiveModelOpenRouterId } from './schema';
 import { callLLM } from './llm';
-import { TOOL_DEFINITIONS, classifySQL, isUnsafeWrite } from './tools';
+import { TOOL_DEFINITIONS, classifySQL, isUnsafeWrite, findMutationTargets, PROTECTED_TABLES } from './tools';
 import { enqueueApproval, processApproval, sweepExpired, listPendingApprovals } from './approval';
 import { sendTelegramMessage } from './telegram';
 import { getSoulPrompt } from './soul';
@@ -107,12 +107,24 @@ export class CatoAgent {
         if (classification === 'read') {
           return `Error: write tool does not accept read-only SQL. Use 'query' instead.`;
         }
+        // Allow-list, not execute-by-default: 'unknown' (ATTACH, ANALYZE, SAVEPOINT,
+        // assignment pragmas, …) must not slip through the write tier.
+        if (classification !== 'write') {
+          return `Error: write tool only accepts INSERT, UPDATE, DELETE, or REPLACE statements. Detected classification: ${classification}.`;
+        }
+        const protectedHits = findMutationTargets(sql).filter((t) => PROTECTED_TABLES.has(t));
+        if (protectedHits.length > 0) {
+          this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'write', sql, rationale }, outcome: 'failure', errorMessage: `Write touches protected table(s): ${protectedHits.join(', ')}` });
+          return `Error: ${protectedHits.join(', ')} is agent infrastructure (audit trail, approvals, model/eval state) and cannot be modified through the write tool.`;
+        }
         if (isUnsafeWrite(sql)) {
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'write', sql, rationale }, outcome: 'failure', errorMessage: 'Unsafe write: DELETE/UPDATE without WHERE clause' });
           return `Error: Unsafe operation rejected. DELETE and UPDATE require a WHERE clause. Provide a WHERE clause to proceed.`;
         }
         try {
-          this.sql.exec(sql);
+          // Consume the cursor: DO SQLite cursors are lazy and the write may
+          // otherwise not execute in production despite being logged as success.
+          this.sql.exec(sql).toArray();
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'write', sql, rationale }, outcome: 'success' });
           return 'Write executed successfully.';
         } catch (err) {

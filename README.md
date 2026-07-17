@@ -377,6 +377,8 @@ The HTTP admin endpoints (`/manifest`, `/invoke`, `/eval/run`, `/eval/runs`, `/a
 
 Rotate `ADMIN_TOKEN` if it ever lands in a shell history, a log, or a screenshot. Tokens live in `.dev.vars` (gitignored) for local dev and in `wrangler secret` for production. Never commit them.
 
+**What "append-only audit trail" means here.** The agent's infrastructure tables (`event_log`, `approval_pending`, `model_registry`, `active_model`, `eval_tasks`, `eval_runs`, `mutations`, `skill_versions`, `_meta_comments`) are on a denylist in the tool layer: any LLM-issued `write` that targets them is rejected and the attempt itself is logged. The boundary of that guarantee: it protects against SQL issued through the agent's tools. Code with direct Durable Object access, and DDL you approve yourself through `propose_ddl`, can still modify these tables. It is a tool-layer control, not a database trigger or a separate write-only store.
+
 ---
 
 ## Telegram Commands
@@ -396,11 +398,13 @@ Rotate `ADMIN_TOKEN` if it ever lands in a shell history, a log, or a screenshot
 
 | Tier | SQL Operations | Gate |
 |------|---------------|------|
-| **Read** | `SELECT`, `PRAGMA`, `EXPLAIN` | None. Runs immediately. |
-| **Write** | `INSERT`, `UPDATE`, `DELETE` with `WHERE` | Runs and is audit logged. |
+| **Read** | `SELECT`, `EXPLAIN`, read-only `PRAGMA` | None. Runs immediately. |
+| **Write** | `INSERT`, `UPDATE`, `DELETE` with `WHERE` | Runs and is audit logged. Denied on protected infrastructure tables. |
 | **DDL** | `CREATE`, `ALTER`, `DROP` | Queued. Requires `/approve <id>`. |
 
-The SQL classifier runs server-side. If the agent tries to call `query` with a `DROP TABLE`, it is rejected with a tier mismatch error regardless of the tool name used.
+The SQL classifier runs server-side. If the agent tries to call `query` with a `DROP TABLE`, it is rejected with a tier mismatch error regardless of the tool name used. `WITH`-prefixed statements are classified by their top-level verb, so a CTE wrapped around an `INSERT` is a write, not a read. Assignment-form pragmas (`PRAGMA writable_schema = ON`) and anything else the classifier cannot place are rejected by every tool: the tiers are allowlists, not filters.
+
+One known limit: the `WHERE` requirement on `UPDATE`/`DELETE` checks that a `WHERE` token is present, not that it constrains anything. `DELETE FROM t WHERE id = id` passes the guard and clears the table. Whole-table protection here is about preventing accidents, not adversarial SQL.
 
 ---
 

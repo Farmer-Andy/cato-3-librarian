@@ -62,6 +62,45 @@ export function isUnsafeWrite(sql: string): boolean {
   return !/\bWHERE\b/.test(stripped);
 }
 
+// --- Protected tables ---
+
+// The agent's own infrastructure tables. LLM-issued SQL must not mutate these:
+// the audit trail is only trustworthy, and the approval queue only meaningful,
+// if the model cannot rewrite them through the write tool. The agent's own code
+// paths (logEvent, processApproval, model switching, eval recording) write them
+// directly and are unaffected. Schema changes to them still go through
+// propose_ddl -> admin approval, which is the intended escape hatch.
+export const PROTECTED_TABLES = new Set([
+  'event_log',
+  'approval_pending',
+  'model_registry',
+  'active_model',
+  'eval_tasks',
+  'eval_runs',
+  'mutations',
+  'skill_versions',
+  '_meta_comments',
+]);
+
+// Mutation targets of a statement: every identifier following INSERT/REPLACE
+// INTO, UPDATE, or DELETE FROM anywhere in the statement, so CTE-wrapped and
+// multi-clause forms are covered. Deliberately over-matches — this feeds a
+// denylist, where a false positive is a safe rejection and a false negative is
+// the failure mode. Handles "quoted", [bracketed], `backticked`, and
+// schema.qualified identifiers.
+export function findMutationTargets(sql: string): string[] {
+  const stripped = stripCommentsAndStrings(sql);
+  const targets: string[] = [];
+  const re = /\b(?:INSERT\s+(?:OR\s+[A-Za-z]+\s+)?INTO|REPLACE\s+INTO|UPDATE(?:\s+OR\s+[A-Za-z]+)?|DELETE\s+FROM)\s+([A-Za-z_"[\]`][\w".[\]`]*)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stripped)) !== null) {
+    const unquoted = m[1].replace(/["[\]`]/g, '');
+    const name = unquoted.slice(unquoted.lastIndexOf('.') + 1);
+    targets.push(name.toLowerCase());
+  }
+  return targets;
+}
+
 function extractFirstKeyword(sql: string): string {
   const match = sql.trim().match(/^([A-Z_]+)/i);
   return match ? match[1].toUpperCase() : '';
