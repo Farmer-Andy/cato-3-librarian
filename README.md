@@ -422,7 +422,7 @@ Rotate `ADMIN_TOKEN` if it ever lands in a shell history, a log, or a screenshot
 
 The SQL classifier runs server-side. If the agent tries to call `query` with a `DROP TABLE`, it is rejected with a tier mismatch error regardless of the tool name used. `WITH`-prefixed statements are classified by their top-level verb, so a CTE wrapped around an `INSERT` is a write, not a read. Assignment-form pragmas (`PRAGMA writable_schema = ON`) and anything else the classifier cannot place are rejected by every tool: the tiers are allowlists, not filters.
 
-The `query` tier caps returned rows at 200. A larger result set is truncated with a note giving the true total, so a `SELECT *` on a big table can't blow up the model's context or run up token cost.
+The `query` tier caps returned rows at 200. It reads the result cursor and stops at the cap rather than materializing the whole result first, so a `SELECT *` on a huge table can't exhaust memory. A truncated result carries a note telling the caller to add a `WHERE` filter or `LIMIT` to narrow it, which also keeps the model's context and token cost bounded.
 
 One known limit: the `WHERE` requirement on `UPDATE`/`DELETE` checks that a `WHERE` token is present, not that it constrains anything. `DELETE FROM t WHERE id = id` passes the guard and clears the table. Whole-table protection here is about preventing accidents, not adversarial SQL.
 

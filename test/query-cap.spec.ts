@@ -27,10 +27,11 @@ describe('query tool row cap (real DO)', () => {
 
       const result = await internals.executeTool('query', { sql: 'SELECT * FROM scratch' }, admin);
 
-      // (a) truncation note with the correct total count
-      expect(result).toContain('[Result truncated: showing the first 200 of 250 rows.');
+      // (a) truncation note. The early-break cursor can no longer report the exact
+      // total (it stops at the cap), so the note directs the caller to narrow.
+      expect(result).toContain('[Result truncated: showing the first 200 rows. Add a WHERE filter or LIMIT to narrow the result.]');
 
-      // (b) the JSON portion parses to exactly 200 rows
+      // (b) the JSON portion parses to exactly 200 rows — the cap held.
       const jsonPart = result.split('\n\n[Result truncated')[0];
       const parsed = JSON.parse(jsonPart) as unknown[];
       expect(parsed).toHaveLength(200);

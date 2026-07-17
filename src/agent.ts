@@ -104,11 +104,23 @@ export class CatoAgent {
           return `Error: query tool only accepts read SQL. Detected classification: ${classification}. Use 'write' for writes or 'propose_ddl' for DDL.`;
         }
         try {
-          const rows = this.sql.exec(sql).toArray();
           const CAP = 200;
-          const body = JSON.stringify(rows.slice(0, CAP), null, 2);
-          const result = rows.length > CAP
-            ? `${body}\n\n[Result truncated: showing the first ${CAP} of ${rows.length} rows. Add a WHERE filter or LIMIT to narrow the result.]`
+          // Iterate the cursor and stop at the cap instead of .toArray()
+          // materializing every row first: a huge SELECT would otherwise exhaust
+          // memory/time before the slice. Early-breaking a READ cursor is safe —
+          // the SELECT has already executed by the time we iterate, so the
+          // lazy-cursor .toArray() rule (which forces writes/DDL to run) does not
+          // apply here. This is the one sanctioned exception to that rule.
+          const cursor = this.sql.exec(sql);
+          const rows: Record<string, unknown>[] = [];
+          let truncated = false;
+          for (const row of cursor) {
+            if (rows.length >= CAP) { truncated = true; break; }
+            rows.push(row as Record<string, unknown>);
+          }
+          const body = JSON.stringify(rows, null, 2);
+          const result = truncated
+            ? `${body}\n\n[Result truncated: showing the first ${CAP} rows. Add a WHERE filter or LIMIT to narrow the result.]`
             : body;
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'query', sql }, outcome: 'success' });
           return result;
