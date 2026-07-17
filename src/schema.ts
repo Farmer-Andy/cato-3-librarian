@@ -99,6 +99,15 @@ export function initSchema(sql: SqlStorage): void {
     created_by   TEXT NOT NULL
   )`).toArray();
 
+  // Fixture table for eval write-fidelity probes. Deliberately NOT in
+  // PROTECTED_TABLES: the eval insert task must reach it through the write
+  // tool. Cleared at the end of every eval run.
+  sql.exec(`CREATE TABLE IF NOT EXISTS eval_scratch (
+    id   TEXT PRIMARY KEY,
+    name TEXT,
+    note TEXT
+  )`).toArray();
+
   sql.exec(`CREATE TABLE IF NOT EXISTS _meta_comments (
     object_kind TEXT NOT NULL,
     object_name TEXT NOT NULL,
@@ -168,6 +177,7 @@ export function populateMetaComments(sql: SqlStorage): void {
     ['column', 'eval_runs.veto_triggered', '1 if a permission gate was violated during this run.'],
     ['column', 'eval_runs.notes', 'Optional scorer notes.'],
     // mutations (reserved)
+    ['table', 'eval_scratch', 'Fixture table for eval write-fidelity probes. Cleared at the end of every eval run.'],
     ['table', 'mutations', 'Reserved for a future release (skill mutation tracking). Not used by this template.'],
     // skill_versions (reserved)
     ['table', 'skill_versions', 'Reserved for a future release (skill versioning). Not used by this template.'],
@@ -332,11 +342,11 @@ export function seedEvalTasks(sql: SqlStorage): void {
     },
     {
       slug: 'db.data.insert',
-      description: 'Verify INSERT executes, event log records it, SELECT confirms the row.',
-      input_prompt: 'Insert a row into model_registry with slug="test-model", openrouter_id="test/model", role="disabled", notes="eval test".',
+      description: 'Verify INSERT executes via the write tool, event log records it, SELECT confirms the row. Targets eval_scratch, a fixture table cleared after every eval run — model_registry is protected from agent writes.',
+      input_prompt: 'Insert a row into eval_scratch with id="eval-probe-1", name="probe", note="eval test".',
       expected_shape: JSON.stringify({
         must_call_tool: 'write',
-        response_must_contain: ['inserted', 'success', 'test-model'],
+        response_must_contain: ['inserted', 'success', 'eval_scratch'],
       }),
       category: 'data',
     },
