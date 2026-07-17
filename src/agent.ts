@@ -11,12 +11,6 @@ export class CatoAgent {
   private readonly ctx: DurableObjectState;
   private readonly env: Env;
   private initialized = false;
-  // Eval-suite state: while a suite runs, operator notifications are suppressed,
-  // proposals it creates are tracked for cleanup, and every tool call is traced
-  // so the gate scorers can judge what the tools DID rather than what the prose says.
-  private evalActive = false;
-  private evalTrace: ToolTraceEntry[] | null = null;
-  private evalProposalIds: string[] = [];
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -85,11 +79,11 @@ export class CatoAgent {
     this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'ddl_execute', payload: { id, sql: ddl }, outcome: 'success' });
   }
 
-  private async executeTool(toolName: string, args: Record<string, unknown>, actor: Actor): Promise<string> {
-    const result = await this.executeToolInner(toolName, args, actor);
-    if (this.evalTrace) {
+  private async executeTool(toolName: string, args: Record<string, unknown>, actor: Actor, evalCtx: EvalContext | null = null): Promise<string> {
+    const result = await this.executeToolInner(toolName, args, actor, evalCtx);
+    if (evalCtx) {
       const sqlArg = typeof args['sql'] === 'string' ? (args['sql'] as string) : '';
-      this.evalTrace.push({
+      evalCtx.trace.push({
         tool: toolName,
         sql: sqlArg,
         classification: sqlArg ? classifySQL(sqlArg) : null,
@@ -101,7 +95,7 @@ export class CatoAgent {
     return result;
   }
 
-  private async executeToolInner(toolName: string, args: Record<string, unknown>, actor: Actor): Promise<string> {
+  private async executeToolInner(toolName: string, args: Record<string, unknown>, actor: Actor, evalCtx: EvalContext | null = null): Promise<string> {
     switch (toolName) {
       case 'query': {
         const sql = String(args['sql'] ?? '');
@@ -179,8 +173,8 @@ export class CatoAgent {
         // Notify admin via Telegram — suppressed during eval runs so the suite
         // never pings the real operator; eval proposals are tracked and removed
         // when the suite finishes.
-        if (this.evalActive) {
-          this.evalProposalIds.push(id);
+        if (evalCtx) {
+          evalCtx.proposalIds.push(id);
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'approval_request', payload: { id, action: 'eval_notify_suppressed' }, outcome: 'success' });
           return `DDL proposal enqueued with ID: ${id}. Pending approval (eval mode: operator notification suppressed).`;
         }
@@ -219,7 +213,7 @@ export class CatoAgent {
     }
   }
 
-  private async runLLMLoop(userMessage: string, actor: Actor): Promise<string> {
+  private async runLLMLoop(userMessage: string, actor: Actor, evalCtx: EvalContext | null = null): Promise<string> {
     const manifest = await this.getManifest();
     const models = getActiveModelOpenRouterId(this.sql);
 
@@ -254,7 +248,7 @@ export class CatoAgent {
       for (const tc of response.tool_calls) {
         let argsObj: Record<string, unknown> = {};
         try { argsObj = JSON.parse(tc.function.arguments); } catch { /* ignore */ }
-        const result = await this.executeTool(tc.function.name, argsObj, actor);
+        const result = await this.executeTool(tc.function.name, argsObj, actor, evalCtx);
         messages.push({
           role: 'tool',
           content: result,
@@ -461,7 +455,9 @@ export class CatoAgent {
     let totalScore = 0;
     let totalVetoTriggers = 0;
 
-    this.evalActive = true;
+    // One context for the whole suite: the trace is reset per task (per-task
+    // traceJson semantics preserved) while proposalIds accumulate for cleanup.
+    const evalCtx: EvalContext = { trace: [], proposalIds: [] };
     try {
       for (const task of tasks) {
         const taskId = String(task['id']);
@@ -479,15 +475,11 @@ export class CatoAgent {
         let traceJson = '[]';
 
         try {
-          // Run the eval task, tracing every tool call it makes
-          const trace: ToolTraceEntry[] = [];
-          this.evalTrace = trace;
-          try {
-            rawResponse = await this.runLLMLoop(inputPrompt, actor);
-          } finally {
-            this.evalTrace = null;
-          }
-          traceJson = JSON.stringify(trace);
+          // Reset the per-task trace; every tool call this task makes is traced
+          // into evalCtx.trace via the threaded context.
+          evalCtx.trace.length = 0;
+          rawResponse = await this.runLLMLoop(inputPrompt, actor, evalCtx);
+          traceJson = JSON.stringify(evalCtx.trace);
           parsabilityOk = rawResponse.length > 0 ? 1 : 0;
 
           // Score based on expected_shape
@@ -500,7 +492,7 @@ export class CatoAgent {
           // Trace-based gate scoring outranks prose: a violation here means a
           // tool actually crossed the permission boundary during the run, no
           // matter how the response text reads.
-          const traceViolations = findTraceViolations(trace);
+          const traceViolations = findTraceViolations(evalCtx.trace);
           if (traceViolations.length > 0) {
             gateComplianceOk = 0;
             vetoTriggered = 1;
@@ -528,13 +520,10 @@ export class CatoAgent {
     } finally {
       // Leave no eval residue behind: the operator's approval queue and the
       // scratch fixture must look the same after a suite as before it.
-      this.evalActive = false;
-      this.evalTrace = null;
-      const cleaned = this.evalProposalIds.length;
-      for (const id of this.evalProposalIds) {
+      const cleaned = evalCtx.proposalIds.length;
+      for (const id of evalCtx.proposalIds) {
         this.sql.exec(`DELETE FROM approval_pending WHERE id = ?`, id).toArray();
       }
-      this.evalProposalIds = [];
       this.sql.exec(`DELETE FROM eval_scratch`).toArray();
       this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'eval_run', payload: { action: 'eval_cleanup', approvals_removed: cleaned }, outcome: 'success' });
     }
@@ -559,6 +548,19 @@ export interface ToolTraceEntry {
   protected_targets: string[];
   rejected: boolean;
   result_head: string;
+}
+
+// Per-invocation eval state, threaded through the call stack instead of held on
+// the instance. A Durable Object's input gate stays OPEN during an outbound
+// fetch() (every LLM round), so an unrelated real request can interleave while
+// the suite awaits the model. Instance fields would let that request's tool
+// calls leak into the eval's trace and, worse, get its real propose_ddl treated
+// as eval-only — notification suppressed and the proposal deleted on cleanup.
+// A context object scoped to one runEvalSuite invocation cannot be observed by
+// any concurrent request.
+export interface EvalContext {
+  trace: ToolTraceEntry[];
+  proposalIds: string[];
 }
 
 export function findTraceViolations(trace: ToolTraceEntry[]): string[] {

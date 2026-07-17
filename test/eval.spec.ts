@@ -1,8 +1,23 @@
 import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { findTraceViolations, type CatoAgent, type ToolTraceEntry } from '../src/agent';
+import { findTraceViolations, type CatoAgent, type EvalContext, type ToolTraceEntry } from '../src/agent';
+import type { Actor } from '../src/types';
+import { stubTelegramFetch } from './helpers';
 
 type AgentInternals = { initialize(): Promise<void> };
+
+// 4-arg executeTool signature to drive the eval-context threading directly.
+type AgentInternalsCtx = {
+  initialize(): Promise<void>;
+  executeTool(
+    toolName: string,
+    args: Record<string, unknown>,
+    actor: Actor,
+    evalCtx: EvalContext | null
+  ): Promise<string>;
+};
+
+const admin: Actor = { id: 'test:admin', role: 'admin' };
 
 interface ScriptedTurn {
   content: string | null;
@@ -167,5 +182,67 @@ describe('eval suite hygiene', () => {
         { tool: 'propose_ddl', sql: 'CREATE TABLE x (id INTEGER)', classification: 'ddl', protected_targets: [], rejected: false, result_head: 'DDL proposal enqueued' },
       ])
     ).toHaveLength(0);
+  });
+});
+
+// Regression for the shared-mutable-instance-state bug: eval behaviour must ride
+// on the threaded evalCtx, never on the instance. A null-context invoke (every
+// real request path) must notify the operator and persist the proposal; only a
+// real evalCtx suppresses and tracks it. If instance fields ever came back, a
+// concurrent real request during a suite's LLM await would leak into these.
+describe('eval context isolation', () => {
+  it('null evalCtx: propose_ddl notifies the operator and the proposal persists', async () => {
+    const calls = stubTelegramFetch();
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName('ctx-null'));
+    const id = await runInDurableObject(stub, async (instance: CatoAgent) => {
+      const internals = instance as unknown as AgentInternalsCtx;
+      await internals.initialize();
+      const result = await internals.executeTool(
+        'propose_ddl',
+        { sql: 'CREATE TABLE ctx_probe_null (id INTEGER)', rationale: 'ctx isolation' },
+        admin,
+        null
+      );
+      const m = result.match(/ID: (\S+?)\./);
+      expect(m).not.toBeNull();
+      // Null-context invoke reports the operator notification, not suppression.
+      expect(result).toContain('Admin has been notified');
+      expect(result).not.toContain('suppressed');
+      return m![1];
+    });
+
+    // The operator was actually notified over Telegram.
+    expect(calls.filter((c) => c.url.includes('sendMessage'))).toHaveLength(1);
+
+    // The proposal survives in the SAME DO — it was NOT deleted as eval residue.
+    const pending = await runInDurableObject(stub, async (_i: CatoAgent, state: DurableObjectState) =>
+      state.storage.sql.exec(`SELECT id FROM approval_pending WHERE id = ?`, id).toArray()
+    );
+    expect(pending).toHaveLength(1);
+  });
+
+  it('real evalCtx: propose_ddl suppresses the notification and tracks the id', async () => {
+    const calls = stubTelegramFetch();
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName('ctx-eval'));
+    const { result, proposalIds, trace } = await runInDurableObject(stub, async (instance: CatoAgent) => {
+      const internals = instance as unknown as AgentInternalsCtx;
+      await internals.initialize();
+      const evalCtx: EvalContext = { trace: [], proposalIds: [] };
+      const result = await internals.executeTool(
+        'propose_ddl',
+        { sql: 'CREATE TABLE ctx_probe_eval (id INTEGER)', rationale: 'ctx isolation' },
+        admin,
+        evalCtx
+      );
+      return { result, proposalIds: [...evalCtx.proposalIds], trace: [...evalCtx.trace] };
+    });
+
+    // Operator notification suppressed: no Telegram traffic at all.
+    expect(calls.filter((c) => c.url.includes('sendMessage'))).toHaveLength(0);
+    expect(result).toContain('operator notification suppressed');
+    // The id is tracked on the context for later cleanup, and the call is traced.
+    expect(proposalIds).toHaveLength(1);
+    expect(trace).toHaveLength(1);
+    expect(trace[0].tool).toBe('propose_ddl');
   });
 });
