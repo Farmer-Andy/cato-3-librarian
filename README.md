@@ -362,7 +362,7 @@ All admin endpoints require a shared-secret bearer token. A request without a va
 | `/eval/runs` | GET | admin | Last 20 eval run records |
 | `/approve/:id` | POST | admin | Approve a pending DDL |
 | `/deny/:id` | POST | admin | Deny a pending DDL |
-| `/webhook/telegram` | POST | secret_token | Telegram webhook receiver; requires the registered `X-Telegram-Bot-Api-Secret-Token` header |
+| `/webhook/telegram` | POST | secret_token | Telegram webhook receiver. Verifies the registered `X-Telegram-Bot-Api-Secret-Token`, then enqueues the update and returns; a Durable Object alarm processes it. |
 
 Authenticate HTTP requests with the admin bearer token:
 
@@ -372,6 +372,14 @@ curl -s -X POST https://my-cato.workers.dev/invoke \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -d '{"message": "What tables exist in this database?"}' | jq .
 ```
+
+### Telegram delivery
+
+Telegram updates are not processed inside the webhook request. The webhook verifies the secret token, resolves the sender, dedups on `update_id`, writes the update into the `telegram_updates` inbox table, and returns `200` right away. Telegram gets its acknowledgement in milliseconds and never waits on a model call, so it does not time out and redeliver.
+
+A Durable Object alarm drains the inbox. It runs the admin command or the full LLM turn with proper execution time, not the roughly 30-second window Cloudflare allows a `waitUntil` task (which could kill a long turn mid-flight). Each update is tried up to three times. A try that throws leaves the row pending and the alarm retries it about 30 seconds later; after three failures the row is marked `failed`, a `telegram_update_failed` event is written to `event_log`, and the alarm moves on. A single poisoned update does not block the ones behind it.
+
+Processing is at-least-once, not exactly-once. If a turn does part of its work (issues a tool call, sends a message) and then fails, that partial work is not rolled back, so a retry can repeat those model actions. This is a deliberate trade for durability: the alarm keeps its per-update bookkeeping even when a turn dies, which is what closes the old failure mode where an update was marked handled but never actually ran.
 
 ---
 
