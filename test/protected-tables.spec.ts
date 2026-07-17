@@ -55,6 +55,7 @@ describe('findMutationTargets', () => {
       'model_registry',
       'mutations',
       'skill_versions',
+      'telegram_updates',
     ]);
   });
 });

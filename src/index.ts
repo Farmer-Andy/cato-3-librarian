@@ -76,7 +76,7 @@ function isAuthorizedAdmin(request: Request, env: Env): boolean {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const agent = getAgent(env);
 
@@ -121,7 +121,15 @@ export default {
         body: JSON.stringify(body),
         redirect: 'manual',
       });
-      return agent.fetch(forwarded);
+      // Async ACK: Telegram's webhook has a short patience window, and the DO runs
+      // the full LLM loop (up to 10 rounds, 60s/model call) before its response
+      // returns. A slow turn would make Telegram time out and REDELIVER the same
+      // update. The reply is not carried in this HTTP body anyway — the DO delivers
+      // it via its own outbound sendTelegramMessage call — so we ACK instantly and
+      // let the DO process in the background. The DO-level update_id dedup makes a
+      // redelivery that still slips through a no-op.
+      ctx.waitUntil(agent.fetch(forwarded));
+      return new Response('', { status: 200 });
     }
 
     // Admin-only HTTP surface: privileged read / exec / mutate endpoints.
@@ -204,6 +212,7 @@ export default {
 };
 
 interface TelegramUpdate {
+  update_id?: number;
   message?: { from?: { id: number }; chat?: { id: number }; text?: string };
   edited_message?: { from?: { id: number }; chat?: { id: number }; text?: string };
 }

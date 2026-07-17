@@ -282,6 +282,23 @@ export class CatoAgent {
     // --- Telegram ---
     if (request.method === 'POST' && url.pathname === '/telegram') {
       const body = await request.json<TelegramUpdate>();
+
+      // Webhook redelivery dedup. Telegram re-delivers when the webhook answers
+      // slowly (long LLM turns exceed its patience). Insert-before-processing =
+      // at-most-once: a concurrent redelivery sees the row and skips instead of
+      // running the whole LLM loop twice. No await inside this block, so the DO's
+      // single-threaded execution makes the SELECT+INSERT atomic.
+      if (typeof body.update_id === 'number') {
+        const dup = this.sql.exec(
+          `SELECT 1 AS x FROM telegram_updates WHERE update_id = ?`, body.update_id
+        ).toArray();
+        if (dup.length > 0) return Response.json({ ok: true, deduplicated: true });
+        this.sql.exec(`INSERT INTO telegram_updates (update_id) VALUES (?)`, body.update_id).toArray();
+        this.sql.exec(
+          `DELETE FROM telegram_updates WHERE seen_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')`
+        ).toArray();
+      }
+
       const message = body.message ?? body.edited_message;
       if (!message?.text) return Response.json({ ok: true });
 
@@ -734,6 +751,7 @@ function escapeHtml(text: string): string {
 }
 
 interface TelegramUpdate {
+  update_id?: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
 }

@@ -100,6 +100,7 @@ export const PROTECTED_TABLES = new Set([
   'mutations',
   'skill_versions',
   '_meta_comments',
+  'telegram_updates',
 ]);
 
 // Mutation targets of a statement: every identifier following INSERT/REPLACE

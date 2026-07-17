@@ -1,5 +1,12 @@
-import { env, runInDurableObject, SELF } from 'cloudflare:test';
+import {
+  createExecutionContext,
+  env,
+  runInDurableObject,
+  SELF,
+  waitOnExecutionContext,
+} from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import worker from '../src/index';
 import type { CatoAgent } from '../src/agent';
 import type { Actor } from '../src/types';
 import { adminUpdate, deriveSecret, stubTelegramFetch, type TelegramCall } from './helpers';
@@ -44,12 +51,21 @@ describe('approved DDL execution', () => {
   it('materializes the schema change before reporting granted (Telegram /approve path)', async () => {
     const id = await proposeDDL('CREATE TABLE approved_widget (id INTEGER PRIMARY KEY)');
 
-    const res = await SELF.fetch('https://example.com/webhook/telegram', {
-      method: 'POST',
-      headers: { 'X-Telegram-Bot-Api-Secret-Token': await deriveSecret(env.ADMIN_TOKEN) },
-      body: adminUpdate(`/approve ${id}`),
-    });
+    // The webhook ACKs instantly and processes in a background waitUntil task, so
+    // drive worker.fetch with an explicit ExecutionContext and flush it before
+    // asserting on the reply the DO delivers out-of-band.
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request('https://example.com/webhook/telegram', {
+        method: 'POST',
+        headers: { 'X-Telegram-Bot-Api-Secret-Token': await deriveSecret(env.ADMIN_TOKEN) },
+        body: adminUpdate(`/approve ${id}`),
+      }),
+      env,
+      ctx,
+    );
     expect(res.status).toBe(200);
+    await waitOnExecutionContext(ctx);
 
     // The reply message reports the grant (earlier sendMessage calls are the
     // proposal notification from propose_ddl — take the latest)

@@ -43,6 +43,15 @@ export function initSchema(sql: SqlStorage): void {
     set_by        TEXT NOT NULL
   )`).toArray();
 
+  // Telegram webhook redelivery dedup. Telegram re-delivers an update when the
+  // webhook is slow to answer (long LLM turns exceed its patience). Without this,
+  // the same message runs the whole LLM loop twice. Insert-before-processing
+  // (at-most-once): a concurrent redelivery sees the row and skips.
+  sql.exec(`CREATE TABLE IF NOT EXISTS telegram_updates (
+    update_id INTEGER PRIMARY KEY,
+    seen_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  )`).toArray();
+
   sql.exec(`CREATE TABLE IF NOT EXISTS eval_tasks (
     id            TEXT PRIMARY KEY,
     slug          TEXT UNIQUE NOT NULL,
@@ -153,6 +162,10 @@ export function populateMetaComments(sql: SqlStorage): void {
     ['column', 'active_model.fallback_slug', 'Slug of the fallback model, null if none.'],
     ['column', 'active_model.set_at', 'When the model was last changed.'],
     ['column', 'active_model.set_by', 'Actor who performed the /model switch.'],
+    // telegram_updates
+    ['table', 'telegram_updates', 'Webhook redelivery dedup: one row per processed Telegram update_id. Insert-before-processing gives at-most-once handling; rows are swept after 7 days.'],
+    ['column', 'telegram_updates.update_id', 'Telegram update_id; primary key. A row here means the update was already processed, so a redelivery is skipped.'],
+    ['column', 'telegram_updates.seen_at', 'ISO8601 UTC timestamp when the update was first seen. Rows older than 7 days are swept on the next insert.'],
     // eval_tasks
     ['table', 'eval_tasks', 'Self-describing eval task definitions. The eval suite lives in the database.'],
     ['column', 'eval_tasks.id', 'ULID primary key.'],

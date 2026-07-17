@@ -1,4 +1,4 @@
-import { env, SELF } from 'cloudflare:test';
+import { createExecutionContext, env, SELF, waitOnExecutionContext } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import type { Env } from '../src/types';
@@ -77,15 +77,26 @@ describe('POST /webhook/telegram authentication', () => {
     expect(telegramCalls).toHaveLength(0);
   });
 
-  it('forwards an authenticated admin command to the agent', async () => {
-    const res = await SELF.fetch('https://example.com/webhook/telegram', {
-      method: 'POST',
-      headers: { 'X-Telegram-Bot-Api-Secret-Token': await deriveSecret(env.ADMIN_TOKEN) },
-      body: adminUpdate('/models'),
-    });
+  it('acks instantly (empty 200) and forwards the admin command to the agent in the background', async () => {
+    // The webhook no longer carries the reply in its HTTP body: it ACKs Telegram
+    // immediately and processes in the background via ctx.waitUntil, so Telegram
+    // never times out and redelivers. Drive worker.fetch directly with an
+    // ExecutionContext so the background task is observable via waitOnExecutionContext.
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request('https://example.com/webhook/telegram', {
+        method: 'POST',
+        headers: { 'X-Telegram-Bot-Api-Secret-Token': await deriveSecret(env.ADMIN_TOKEN) },
+        body: adminUpdate('/models'),
+      }),
+      env,
+      ctx,
+    );
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
-    // /models replies via the Telegram API — proof the command surface was reached.
+    expect(await res.text()).toBe('');
+    // The DO delivers the /models reply via the Telegram API in the background —
+    // flush the waitUntil task, then prove the command surface was reached.
+    await waitOnExecutionContext(ctx);
     expect(telegramCalls).toHaveLength(1);
     expect(telegramCalls[0].url).toContain('sendMessage');
   });
@@ -98,7 +109,8 @@ describe('POST /webhook/telegram authentication', () => {
         headers: { 'X-Telegram-Bot-Api-Secret-Token': await deriveSecret('') },
         body: adminUpdate('/models'),
       }),
-      bare
+      bare,
+      createExecutionContext(),
     );
     expect(res.status).toBe(401);
   });
