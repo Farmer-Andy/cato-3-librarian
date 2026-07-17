@@ -1,6 +1,8 @@
 # Cato-3: Database Librarian
 
-A deployable Cloudflare Workers + Durable Objects database agent. Drop it on any SQLite schema and get a Telegram-accessible AI that can read, write, propose schema changes, and govern its own actions, all with an append-only audit trail and an admin approval gate on DDL.
+[![CI](https://github.com/Farmer-Andy/cato-3-librarian/actions/workflows/ci.yml/badge.svg)](https://github.com/Farmer-Andy/cato-3-librarian/actions/workflows/ci.yml)
+
+A deployable Cloudflare Workers + Durable Objects database agent. It owns its own Durable-Object-local SQLite database: you define your tables in `src/schema.ts`, deploy, and get a Telegram-accessible AI that can read, write, propose schema changes, and govern its own actions, all with an append-only audit trail and an admin approval gate on DDL.
 
 This repo is the **base template**. Clone it, customize two files, deploy. That is the full workflow.
 
@@ -34,7 +36,7 @@ curl -s -X POST https://my-cato.<your-subdomain>.workers.dev/setup/webhook \
 curl https://my-cato.<your-subdomain>.workers.dev/health
 ```
 
-That gets you a running librarian over the default schema. To point it at your own data, see [Setting Up Your Schema](#setting-up-your-schema). The full step-by-step is in [Deployment](#deployment).
+That gets you a running librarian over the default schema. To define your own tables, see [Setting Up Your Schema](#setting-up-your-schema). The full step-by-step is in [Deployment](#deployment).
 
 ---
 
@@ -75,6 +77,12 @@ Key source files:
 | `src/approval.ts` | Approval queue (enqueue, process, TTL sweep) |
 | `src/llm.ts` | OpenRouter client with fallback |
 | `src/index.ts` | Edge Worker entry point |
+
+### Single Durable Object by design
+
+The Worker routes every request to one Durable Object instance, resolved by `idFromName('cato3-primary')` in `src/index.ts`. Requests therefore serialize through a single agent that owns one governed database and one audit timeline. This is intentional for a single-tenant librarian, not a concurrency bug: with exactly one instance, every request sees the same schema and event log, and the DDL approval gate stays authoritative because there is only one place a change can be queued or approved.
+
+Sharding across multiple Durable Objects, or running one agent per tenant, is out of scope for this checkpoint. Multi-tenant isolation is [roadmapped](#roadmap).
 
 ---
 

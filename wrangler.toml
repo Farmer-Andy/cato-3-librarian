@@ -3,6 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2025-12-01"
 compatibility_flags = ["nodejs_compat"]
 
+[observability]
+enabled = true
+
 [durable_objects]
 bindings = [
   { name = "CATO_AGENT", class_name = "CatoAgent" }

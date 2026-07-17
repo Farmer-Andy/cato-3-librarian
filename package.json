@@ -1,7 +1,21 @@
 {
-  "name": "cato3",
+  "name": "cato-3-librarian",
   "version": "0.1.0",
   "private": true,
+  "description": "A deployable, governed AI database librarian for Cloudflare Workers + Durable Objects, with tiered SQL permissions, an admin DDL approval gate, and an append-only audit trail.",
+  "license": "MIT",
+  "author": "Farmer Andy Tech",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Farmer-Andy/cato-3-librarian.git"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "durable-objects",
+    "sqlite",
+    "llm-agent",
+    "telegram-bot"
+  ],
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
