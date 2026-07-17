@@ -67,6 +67,26 @@ describe('classifySQL', () => {
     expect(classifySQL('PRAGMA case_sensitive_like = 1')).toBe('unknown');
     expect(classifySQL('PRAGMA journal_mode = WAL')).toBe('unknown');
   });
+
+  it('splits value pragmas from lookup pragmas on the call form', () => {
+    // Call form of a VALUE pragma IS assignment: PRAGMA user_version(9) sets the
+    // user version. These must classify unknown so they never reach the read tier.
+    expect(classifySQL('PRAGMA user_version(9)')).toBe('unknown');
+    expect(classifySQL('PRAGMA page_size(4096)')).toBe('unknown');
+    expect(classifySQL("PRAGMA encoding('UTF-8')")).toBe('unknown');
+    expect(classifySQL('PRAGMA auto_vacuum(2)')).toBe('unknown');
+    expect(classifySQL('PRAGMA schema_version(1)')).toBe('unknown');
+    // Call form of a LOOKUP pragma is a read: the argument names the object.
+    expect(classifySQL('PRAGMA table_info(users)')).toBe('read');
+    expect(classifySQL('PRAGMA integrity_check(10)')).toBe('read');
+    expect(classifySQL('PRAGMA foreign_key_list(users)')).toBe('read');
+    // Bare value pragmas remain reads.
+    expect(classifySQL('PRAGMA user_version')).toBe('read');
+    expect(classifySQL('PRAGMA page_size')).toBe('read');
+    // Quoted names — even of a lookup pragma — are never bare, so unknown.
+    expect(classifySQL('PRAGMA "user_version"')).toBe('unknown');
+    expect(classifySQL('PRAGMA "user_version"(9)')).toBe('unknown');
+  });
 });
 
 describe('isUnsafeWrite', () => {
@@ -138,6 +158,49 @@ describe('query tool boundary (real DO SQLite)', () => {
       const result = await internals.executeTool('query', { sql: 'PRAGMA foreign_keys(0)' }, admin);
       expect(result).toContain('query tool only accepts read SQL');
       expect(result).toContain('unknown');
+    });
+  });
+
+  it('rejects a call-form value pragma (user_version(9)) through the query tool', async () => {
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName('classifier-test-uv'));
+    await runInDurableObject(stub, async (instance: CatoAgent) => {
+      const internals = instance as unknown as AgentInternals;
+      await internals.initialize();
+      // Call form of a value pragma is assignment: PRAGMA user_version(9) sets
+      // state. Classified 'unknown', the query tier refuses it before SQLite.
+      const result = await internals.executeTool('query', { sql: 'PRAGMA user_version(9)' }, admin);
+      expect(result).toContain('query tool only accepts read SQL');
+      expect(result).toContain('unknown');
+    });
+  });
+
+  it('probes raw PRAGMA user_version(9) against DO SQLite to pin workerd behavior', async () => {
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName('classifier-test-uv-probe'));
+    await runInDurableObject(stub, async (instance: CatoAgent, state: DurableObjectState) => {
+      await (instance as unknown as AgentInternals).initialize();
+
+      let threw = false;
+      let errText = '';
+      try {
+        // Raw call-form value pragma straight to DO SQLite, no classifier in the
+        // path. This pins what workerd actually does with the assignment form.
+        state.storage.sql.exec('PRAGMA user_version(9)').toArray();
+      } catch (err) {
+        threw = true;
+        errText = String(err);
+      }
+
+      // PINNED WORKERD BEHAVIOR (workerd 1.20260415.1, DO SQLite): the call-form
+      // value pragma PRAGMA user_version(9) THROWS "not authorized: SQLITE_AUTH".
+      // workerd's SQLite authorizer blocks the user_version pragma outright (the
+      // bare read form throws SQLITE_AUTH too), so the assignment never lands and
+      // no state changes. The classifier refuses the call form independently
+      // (classified 'unknown', see the query-tool rejection test above), so the
+      // safety guarantee does NOT depend on this runtime throw. If a future
+      // workerd stops throwing here, this assertion flips and the classifier
+      // becomes the only thing standing between the agent and a silent write.
+      expect(threw).toBe(true);
+      expect(errText).toContain('SQLITE_AUTH');
     });
   });
 });

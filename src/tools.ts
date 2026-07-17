@@ -17,10 +17,11 @@ export function classifySQL(sql: string): SQLClass {
   // it as read by first keyword alone let CTE-wrapped mutations through the
   // read-only query tool. Classify by the top-level statement verb instead.
   if (firstKeyword === 'WITH') return classifyCTE(stripped);
-  // PRAGMA is an allowlist, not a denylist: only a bare, unquoted introspection
-  // pragma name is a read. Quoted/bracketed names and the call form of an
-  // assignment (PRAGMA foreign_keys(0)) mutate connection/transaction state and
-  // must never reach the read tier.
+  // PRAGMA is an allowlist, not a denylist. Introspection pragmas are reads;
+  // value pragmas are reads only in bare form, because their call form is
+  // assignment (PRAGMA user_version(9) sets the user version). Quoted/bracketed
+  // names and every assignment form must never reach the read tier. See
+  // classifyPragma.
   if (firstKeyword === 'PRAGMA') return classifyPragma(stripped);
   if (READ_KEYWORDS.has(firstKeyword)) return 'read';
   return 'unknown';
@@ -50,26 +51,45 @@ function classifyCTE(stripped: string): SQLClass {
   return 'unknown';
 }
 
-// Read-only introspection pragmas. Only these, in bare `PRAGMA name` or
-// `PRAGMA name(args)` form, are reads. Assignment pragmas, quoted/bracketed
-// names, and any pragma not on this list are 'unknown' and rejected by every
-// tool — a quoted or call-form assignment like PRAGMA "foreign_keys" = 0 or
-// PRAGMA foreign_keys(0) must never reach the read tier.
-const READONLY_PRAGMAS = new Set([
+// Read-only introspection pragmas, split by whether the CALL form is safe.
+//
+// CALLABLE_READONLY_PRAGMAS: the call form is a lookup, never an assignment. The
+// argument names the object to introspect (a table or index name, or a bound for
+// a check), so both `PRAGMA table_info(users)` and the bare form are reads.
+const CALLABLE_READONLY_PRAGMAS = new Set([
   'table_info', 'table_xinfo', 'table_list', 'index_list', 'index_info',
-  'index_xinfo', 'foreign_key_list', 'database_list', 'collation_list',
-  'function_list', 'pragma_list', 'compile_options', 'freelist_count',
-  'page_count', 'page_size', 'schema_version', 'user_version',
-  'integrity_check', 'quick_check', 'encoding', 'auto_vacuum',
+  'index_xinfo', 'foreign_key_list', 'integrity_check', 'quick_check',
+]);
+
+// BARE_ONLY_READONLY_PRAGMAS: read-only in bare form only. Their call form IS
+// the assignment syntax: `PRAGMA user_version(9)` sets the user version and
+// `PRAGMA page_size(4096)` sets the page size, exactly like `PRAGMA name = value`.
+// Bare `PRAGMA user_version` reads; the call form must classify 'unknown' so it
+// never reaches the read tier.
+const BARE_ONLY_READONLY_PRAGMAS = new Set([
+  'database_list', 'collation_list', 'function_list', 'pragma_list',
+  'compile_options', 'freelist_count', 'page_count', 'page_size',
+  'schema_version', 'user_version', 'encoding', 'auto_vacuum',
 ]);
 
 function classifyPragma(stripped: string): SQLClass {
-  // Bare name or name(args); name must be unquoted and on the allowlist. The
-  // trailing (\(|$|;) rejects the assignment form: `PRAGMA user_version = 7`
-  // has `=` after the name, the group fails to match, and it falls to unknown.
-  const m = stripped.match(/^\s*PRAGMA\s+([A-Za-z_][A-Za-z0-9_]*)\s*(\(|$|;)/i);
+  // Parse `PRAGMA <name>` and the form that follows it: assignment (`=`), call
+  // (`(`), or bare (end of statement or a trailing `;`). The name must be an
+  // unquoted identifier, so quoted/bracketed names never match and fall to
+  // 'unknown' (e.g. `PRAGMA "user_version" = 0`).
+  const m = stripped.match(/^\s*PRAGMA\s+([A-Za-z_][A-Za-z0-9_]*)\s*(\(|=|;|$)/i);
   if (!m) return 'unknown';
-  return READONLY_PRAGMAS.has(m[1].toLowerCase()) ? 'read' : 'unknown';
+  const name = m[1].toLowerCase();
+  const form = m[2];
+  // Assignment (`PRAGMA name = value`) writes connection/database state.
+  if (form === '=') return 'unknown';
+  // Call form (`PRAGMA name(arg)`) is a read only when the argument is a lookup
+  // key, never a value to set. For value pragmas the call form IS assignment.
+  if (form === '(') return CALLABLE_READONLY_PRAGMAS.has(name) ? 'read' : 'unknown';
+  // Bare form: a read if the name is on either allowlist.
+  return CALLABLE_READONLY_PRAGMAS.has(name) || BARE_ONLY_READONLY_PRAGMAS.has(name)
+    ? 'read'
+    : 'unknown';
 }
 
 export function isUnsafeWrite(sql: string): boolean {
