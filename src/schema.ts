@@ -205,7 +205,7 @@ export function populateMetaComments(sql: SqlStorage): void {
     sql.exec(
       `INSERT OR REPLACE INTO _meta_comments (object_kind, object_name, comment) VALUES (?, ?, ?)`,
       kind, name, comment
-    );
+    ).toArray();
   }
 }
 
@@ -219,7 +219,7 @@ export function seedModelRegistry(sql: SqlStorage): void {
     sql.exec(
       `INSERT OR IGNORE INTO model_registry (slug, openrouter_id, role, notes) VALUES (?, ?, ?, ?)`,
       m.slug, m.id, m.role, m.notes
-    );
+    ).toArray();
   }
 
   // Seed active_model only if not already set
@@ -227,7 +227,7 @@ export function seedModelRegistry(sql: SqlStorage): void {
   if (existing.length === 0) {
     sql.exec(
       `INSERT INTO active_model (singleton, primary_slug, fallback_slug, set_by) VALUES (1, 'mimo-pro', 'minimax-m3', 'seed')`,
-    );
+    ).toArray();
   }
 }
 
@@ -507,7 +507,7 @@ export function seedEvalTasks(sql: SqlStorage): void {
       sql.exec(
         `INSERT INTO eval_tasks (id, slug, description, input_prompt, expected_shape, category) VALUES (?, ?, ?, ?, ?, ?)`,
         generateULID(), task.slug, task.description, task.input_prompt, task.expected_shape, task.category
-      );
+      ).toArray();
     }
   }
 }

@@ -62,7 +62,7 @@ export class CatoAgent {
       JSON.stringify(params.payload),
       params.outcome,
       params.errorMessage ?? null
-    );
+    ).toArray();
   }
 
   // Approved-DDL execution. The cursor MUST be consumed (.toArray()) before the
@@ -360,7 +360,7 @@ export class CatoAgent {
           await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Model '${slug}' not found or disabled. Use /models to list available models.`);
           return Response.json({ ok: true });
         }
-        this.sql.exec(`UPDATE active_model SET primary_slug = ?, set_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), set_by = ? WHERE singleton = 1`, slug, actor.id);
+        this.sql.exec(`UPDATE active_model SET primary_slug = ?, set_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), set_by = ? WHERE singleton = 1`, slug, actor.id).toArray();
         this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { action: 'model_switch', new_model: slug }, outcome: 'success' });
         await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Primary model switched to <code>${slug}</code>.`);
         return Response.json({ ok: true });
@@ -526,7 +526,7 @@ export class CatoAgent {
           `INSERT INTO eval_runs (id, task_id, model_slug, raw_response, schema_introspection_ok, write_fidelity_ok, gate_compliance_ok, parsability_ok, composite_score, veto_triggered, notes)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           runId, taskId, models.primary, rawResponse, schemaIntrospectionOk, writeFidelityOk, gateComplianceOk, parsabilityOk, composite, vetoTriggered, traceJson
-        );
+        ).toArray();
 
         this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'eval_run', payload: { task_slug: slug, run_id: runId, composite_score: composite }, outcome: 'success' });
 

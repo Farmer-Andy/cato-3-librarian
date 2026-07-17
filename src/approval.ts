@@ -23,7 +23,7 @@ export function enqueueApproval(
     `INSERT INTO approval_pending (id, expires_at, requested_by, operation_kind, sql_text, rationale)
      VALUES (?, ?, ?, ?, ?, ?)`,
     id, expiresAt, params.requestedBy, params.operationKind, params.sqlText, params.rationale
-  );
+  ).toArray();
   return id;
 }
 
@@ -49,24 +49,24 @@ export function processApproval(
 
   const now = new Date().toISOString();
   if (row['expires_at'] as string < now) {
-    sql.exec(`UPDATE approval_pending SET status = 'expired' WHERE id = ?`, id);
+    sql.exec(`UPDATE approval_pending SET status = 'expired' WHERE id = ?`, id).toArray();
     return { ok: false, message: `Approval ${id} has expired` };
   }
 
   // Flip to a transitional status to prevent TTL race
-  sql.exec(`UPDATE approval_pending SET status = 'executing' WHERE id = ?`, id);
+  sql.exec(`UPDATE approval_pending SET status = 'executing' WHERE id = ?`, id).toArray();
 
   if (action === 'granted') {
     try {
       onGrant(row['sql_text'] as string);
-      sql.exec(`UPDATE approval_pending SET status = 'granted' WHERE id = ?`, id);
+      sql.exec(`UPDATE approval_pending SET status = 'granted' WHERE id = ?`, id).toArray();
       return { ok: true, message: `Approval ${id} granted and executed by ${adminActor}` };
     } catch (err) {
-      sql.exec(`UPDATE approval_pending SET status = 'pending' WHERE id = ?`, id);
+      sql.exec(`UPDATE approval_pending SET status = 'pending' WHERE id = ?`, id).toArray();
       return { ok: false, message: `Execution failed: ${String(err)}` };
     }
   } else {
-    sql.exec(`UPDATE approval_pending SET status = 'denied' WHERE id = ?`, id);
+    sql.exec(`UPDATE approval_pending SET status = 'denied' WHERE id = ?`, id).toArray();
     return { ok: true, message: `Approval ${id} denied by ${adminActor}` };
   }
 }
@@ -75,7 +75,7 @@ export function sweepExpired(sql: SqlStorage): number {
   const now = new Date().toISOString();
   sql.exec(
     `UPDATE approval_pending SET status = 'expired' WHERE status = 'pending' AND expires_at < ?`, now
-  );
+  ).toArray();
   const rows = sql.exec(`SELECT changes() as n`).toArray();
   return rows.length > 0 ? Number((rows[0] as Record<string, unknown>)['n']) : 0;
 }
