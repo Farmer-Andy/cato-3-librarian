@@ -105,8 +105,13 @@ export class CatoAgent {
         }
         try {
           const rows = this.sql.exec(sql).toArray();
+          const CAP = 200;
+          const body = JSON.stringify(rows.slice(0, CAP), null, 2);
+          const result = rows.length > CAP
+            ? `${body}\n\n[Result truncated: showing the first ${CAP} of ${rows.length} rows. Add a WHERE filter or LIMIT to narrow the result.]`
+            : body;
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'query', sql }, outcome: 'success' });
-          return JSON.stringify(rows, null, 2);
+          return result;
         } catch (err) {
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'query', sql }, outcome: 'failure', errorMessage: String(err) });
           return `Error executing query: ${String(err)}`;
