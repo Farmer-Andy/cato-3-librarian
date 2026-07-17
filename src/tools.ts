@@ -17,9 +17,11 @@ export function classifySQL(sql: string): SQLClass {
   // it as read by first keyword alone let CTE-wrapped mutations through the
   // read-only query tool. Classify by the top-level statement verb instead.
   if (firstKeyword === 'WITH') return classifyCTE(stripped);
-  // Assignment-form pragmas (PRAGMA writable_schema = ON, PRAGMA user_version = 7)
-  // mutate state; only the bare/function forms are reads.
-  if (firstKeyword === 'PRAGMA') return isPragmaAssignment(stripped) ? 'unknown' : 'read';
+  // PRAGMA is an allowlist, not a denylist: only a bare, unquoted introspection
+  // pragma name is a read. Quoted/bracketed names and the call form of an
+  // assignment (PRAGMA foreign_keys(0)) mutate connection/transaction state and
+  // must never reach the read tier.
+  if (firstKeyword === 'PRAGMA') return classifyPragma(stripped);
   if (READ_KEYWORDS.has(firstKeyword)) return 'read';
   return 'unknown';
 }
@@ -48,8 +50,26 @@ function classifyCTE(stripped: string): SQLClass {
   return 'unknown';
 }
 
-function isPragmaAssignment(stripped: string): boolean {
-  return /^\s*PRAGMA\s+[A-Za-z_.]+\s*=/i.test(stripped);
+// Read-only introspection pragmas. Only these, in bare `PRAGMA name` or
+// `PRAGMA name(args)` form, are reads. Assignment pragmas, quoted/bracketed
+// names, and any pragma not on this list are 'unknown' and rejected by every
+// tool — a quoted or call-form assignment like PRAGMA "foreign_keys" = 0 or
+// PRAGMA foreign_keys(0) must never reach the read tier.
+const READONLY_PRAGMAS = new Set([
+  'table_info', 'table_xinfo', 'table_list', 'index_list', 'index_info',
+  'index_xinfo', 'foreign_key_list', 'database_list', 'collation_list',
+  'function_list', 'pragma_list', 'compile_options', 'freelist_count',
+  'page_count', 'page_size', 'schema_version', 'user_version',
+  'integrity_check', 'quick_check', 'encoding', 'auto_vacuum',
+]);
+
+function classifyPragma(stripped: string): SQLClass {
+  // Bare name or name(args); name must be unquoted and on the allowlist. The
+  // trailing (\(|$|;) rejects the assignment form: `PRAGMA user_version = 7`
+  // has `=` after the name, the group fails to match, and it falls to unknown.
+  const m = stripped.match(/^\s*PRAGMA\s+([A-Za-z_][A-Za-z0-9_]*)\s*(\(|$|;)/i);
+  if (!m) return 'unknown';
+  return READONLY_PRAGMAS.has(m[1].toLowerCase()) ? 'read' : 'unknown';
 }
 
 export function isUnsafeWrite(sql: string): boolean {

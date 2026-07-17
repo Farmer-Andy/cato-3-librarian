@@ -43,6 +43,30 @@ describe('classifySQL', () => {
     expect(classifySQL('PRAGMA table_info(event_log)')).toBe('read');
     expect(classifySQL('PRAGMA table_list')).toBe('read');
   });
+
+  it('allows only bare, unquoted introspection pragmas as reads', () => {
+    // Bare name or name(args), name on the read-only allowlist → read.
+    expect(classifySQL('PRAGMA table_info(users)')).toBe('read');
+    expect(classifySQL('PRAGMA table_list')).toBe('read');
+    expect(classifySQL('PRAGMA foreign_key_list(x)')).toBe('read');
+    // Quoted ARG is fine — the NAME index_list is bare and on the allowlist.
+    expect(classifySQL('PRAGMA index_list("t")')).toBe('read');
+  });
+
+  it('rejects quoted, bracketed, and call-form assignment pragmas as unknown', () => {
+    // Assignment forms — these mutate connection/transaction state.
+    expect(classifySQL('PRAGMA foreign_keys = 0')).toBe('unknown');
+    expect(classifySQL('PRAGMA "foreign_keys" = 0')).toBe('unknown');
+    expect(classifySQL('PRAGMA [foreign_keys] = 0')).toBe('unknown');
+    // Call form of an assignment — DOES execute and weaken FK enforcement.
+    expect(classifySQL('PRAGMA foreign_keys(0)')).toBe('unknown');
+    // Quoted NAME — even of an allowlisted pragma — is not bare, so unknown.
+    expect(classifySQL('PRAGMA "table_info"(users)')).toBe('unknown');
+    // Other assignment pragmas.
+    expect(classifySQL('PRAGMA writable_schema = 1')).toBe('unknown');
+    expect(classifySQL('PRAGMA case_sensitive_like = 1')).toBe('unknown');
+    expect(classifySQL('PRAGMA journal_mode = WAL')).toBe('unknown');
+  });
 });
 
 describe('isUnsafeWrite', () => {
@@ -101,6 +125,19 @@ describe('query tool boundary (real DO SQLite)', () => {
       await internals.initialize();
       const result = await internals.executeTool('query', { sql: 'SELECT 1 AS one' }, admin);
       expect(JSON.parse(result)).toEqual([{ one: 1 }]);
+    });
+  });
+
+  it('rejects a call-form assignment pragma through the query tool (unknown, not executed)', async () => {
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName('classifier-test-pragma'));
+    await runInDurableObject(stub, async (instance: CatoAgent) => {
+      const internals = instance as unknown as AgentInternals;
+      await internals.initialize();
+      // PRAGMA foreign_keys(0) DOES execute and weaken FK enforcement in workerd
+      // if it reaches SQLite. Classified 'unknown', the tier check rejects it.
+      const result = await internals.executeTool('query', { sql: 'PRAGMA foreign_keys(0)' }, admin);
+      expect(result).toContain('query tool only accepts read SQL');
+      expect(result).toContain('unknown');
     });
   });
 });
