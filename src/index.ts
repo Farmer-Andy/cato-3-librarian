@@ -15,6 +15,13 @@ async function forwardToAgent(
   extraHeaders?: Record<string, string>
 ): Promise<Response> {
   const headers = new Headers(request.headers);
+  // X-Cato-Actor / X-Cato-Role are Worker-set trust headers: the Worker assigns
+  // the actor and role only after authenticating the request. Strip any inbound
+  // copies so a client can't inject them on a forwarded route that doesn't
+  // re-set them (e.g. /health), which would otherwise reach the DO as a spoofed
+  // identity. The per-route overrides below then apply the trusted values.
+  headers.delete('X-Cato-Actor');
+  headers.delete('X-Cato-Role');
   for (const [k, v] of Object.entries(extraHeaders ?? {})) {
     headers.set(k, v);
   }
@@ -113,6 +120,10 @@ export default {
 
       // Reconstruct request with original body for forwarding
       const headers = new Headers(request.headers);
+      // Strip any client-supplied trust headers before setting the authenticated
+      // actor (defense in depth; the .set() calls below already overwrite them).
+      headers.delete('X-Cato-Actor');
+      headers.delete('X-Cato-Role');
       headers.set('X-Cato-Actor', actor.id);
       headers.set('X-Cato-Role', actor.role);
       const forwarded = new Request('https://agent.internal/telegram', {
