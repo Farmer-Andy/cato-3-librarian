@@ -43,14 +43,52 @@ export function initSchema(sql: SqlStorage): void {
     set_by        TEXT NOT NULL
   )`).toArray();
 
-  // Telegram webhook redelivery dedup. Telegram re-delivers an update when the
-  // webhook is slow to answer (long LLM turns exceed its patience). Without this,
-  // the same message runs the whole LLM loop twice. Insert-before-processing
-  // (at-most-once): a concurrent redelivery sees the row and skips.
+  // Telegram inbox + redelivery dedup. This one table is both the dedup key and
+  // the work queue. The webhook handler does INSERT OR IGNORE (dedup) and returns
+  // immediately; a DO alarm drains pending rows and runs the LLM loop with proper
+  // execution time and retry accounting. A redelivery of an update_id already in
+  // the table is ignored. payload holds the full update JSON so the alarm can
+  // reconstruct processing without re-receiving it. status is pending|done|failed.
   sql.exec(`CREATE TABLE IF NOT EXISTS telegram_updates (
-    update_id INTEGER PRIMARY KEY,
-    seen_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    update_id    INTEGER PRIMARY KEY,
+    seen_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    status       TEXT NOT NULL DEFAULT 'pending',
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    chat_id      INTEGER,
+    text         TEXT,
+    payload      TEXT,
+    processed_at TEXT
   )`).toArray();
+
+  // Additive migration. An older deployment (or a persisted pool-workers test DB)
+  // may already hold a telegram_updates table with only (update_id, seen_at). A
+  // CREATE TABLE IF NOT EXISTS leaves that old shape untouched, so ALTER in any
+  // columns that are missing. Never DROP the table: it is the live dedup ledger.
+  // One statement per exec, .toArray() on each (lazy-cursor rule).
+  const tuCols = new Set(
+    sql
+      .exec(`PRAGMA table_info(telegram_updates)`)
+      .toArray()
+      .map((r) => String((r as Record<string, unknown>)['name']))
+  );
+  if (!tuCols.has('status')) sql.exec(`ALTER TABLE telegram_updates ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`).toArray();
+  if (!tuCols.has('attempts')) sql.exec(`ALTER TABLE telegram_updates ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`).toArray();
+  if (!tuCols.has('chat_id')) sql.exec(`ALTER TABLE telegram_updates ADD COLUMN chat_id INTEGER`).toArray();
+  if (!tuCols.has('text')) sql.exec(`ALTER TABLE telegram_updates ADD COLUMN text TEXT`).toArray();
+  if (!tuCols.has('payload')) sql.exec(`ALTER TABLE telegram_updates ADD COLUMN payload TEXT`).toArray();
+  if (!tuCols.has('processed_at')) sql.exec(`ALTER TABLE telegram_updates ADD COLUMN processed_at TEXT`).toArray();
+
+  // Rows carried over from the old insert-before-process schema represent updates
+  // that were already handled (under the old at-most-once semantics a row meant
+  // "processed"). They have no stored payload, so the alarm could not replay them.
+  // Mark them done once, at migration time, so the drain loop skips them instead
+  // of churning. A freshly created table has no such rows, so this is a no-op there.
+  if (!tuCols.has('payload')) {
+    sql.exec(
+      `UPDATE telegram_updates SET status = 'done', processed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE payload IS NULL AND status = 'pending'`
+    ).toArray();
+  }
+  sql.exec(`CREATE INDEX IF NOT EXISTS idx_telegram_updates_status ON telegram_updates(status, update_id)`).toArray();
 
   sql.exec(`CREATE TABLE IF NOT EXISTS eval_tasks (
     id            TEXT PRIMARY KEY,
@@ -163,9 +201,15 @@ export function populateMetaComments(sql: SqlStorage): void {
     ['column', 'active_model.set_at', 'When the model was last changed.'],
     ['column', 'active_model.set_by', 'Actor who performed the /model switch.'],
     // telegram_updates
-    ['table', 'telegram_updates', 'Webhook redelivery dedup: one row per processed Telegram update_id. Insert-before-processing gives at-most-once handling; rows are swept after 7 days.'],
-    ['column', 'telegram_updates.update_id', 'Telegram update_id; primary key. A row here means the update was already processed, so a redelivery is skipped.'],
-    ['column', 'telegram_updates.seen_at', 'ISO8601 UTC timestamp when the update was first seen. Rows older than 7 days are swept on the next insert.'],
+    ['table', 'telegram_updates', 'Telegram inbox and redelivery dedup: one row per Telegram update_id. The webhook does INSERT OR IGNORE and returns; a DO alarm drains pending rows through the LLM loop. At-least-once handling with a 3-attempt bound. Done/failed rows are swept after 7 days.'],
+    ['column', 'telegram_updates.update_id', 'Telegram update_id; primary key. A row here means the update was already accepted, so a redelivery is ignored.'],
+    ['column', 'telegram_updates.seen_at', 'ISO8601 UTC timestamp when the update was first accepted. Done/failed rows older than 7 days are swept in the alarm.'],
+    ['column', 'telegram_updates.status', 'pending | done | failed. pending rows are the work queue; failed rows exhausted 3 attempts.'],
+    ['column', 'telegram_updates.attempts', 'Number of processing attempts so far. At 3, the row is marked failed and a telegram_update_failed event is logged.'],
+    ['column', 'telegram_updates.chat_id', 'Telegram chat id the update belongs to, null for updates without a message.'],
+    ['column', 'telegram_updates.text', 'Message text, null for non-text updates. Convenience mirror of the payload for inspection.'],
+    ['column', 'telegram_updates.payload', 'Full Telegram update JSON, so the alarm can reconstruct processing without re-receiving it.'],
+    ['column', 'telegram_updates.processed_at', 'ISO8601 UTC timestamp when the row reached done or failed, null while pending.'],
     // eval_tasks
     ['table', 'eval_tasks', 'Self-describing eval task definitions. The eval suite lives in the database.'],
     ['column', 'eval_tasks.id', 'ULID primary key.'],

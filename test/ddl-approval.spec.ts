@@ -1,15 +1,8 @@
-import {
-  createExecutionContext,
-  env,
-  runInDurableObject,
-  SELF,
-  waitOnExecutionContext,
-} from 'cloudflare:test';
+import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import worker from '../src/index';
 import type { CatoAgent } from '../src/agent';
 import type { Actor } from '../src/types';
-import { adminUpdate, deriveSecret, stubTelegramFetch, type TelegramCall } from './helpers';
+import { clearInbox, stubTelegramFetch, type TelegramCall } from './helpers';
 
 type AgentInternals = {
   initialize(): Promise<void>;
@@ -49,23 +42,33 @@ async function readAgentState(query: string): Promise<Array<Record<string, unkno
 
 describe('approved DDL execution', () => {
   it('materializes the schema change before reporting granted (Telegram /approve path)', async () => {
+    await clearInbox('cato3-primary');
     const id = await proposeDDL('CREATE TABLE approved_widget (id INTEGER PRIMARY KEY)');
 
-    // The webhook ACKs instantly and processes in a background waitUntil task, so
-    // drive worker.fetch with an explicit ExecutionContext and flush it before
-    // asserting on the reply the DO delivers out-of-band.
-    const ctx = createExecutionContext();
-    const res = await worker.fetch(
-      new Request('https://example.com/webhook/telegram', {
-        method: 'POST',
-        headers: { 'X-Telegram-Bot-Api-Secret-Token': await deriveSecret(env.ADMIN_TOKEN) },
-        body: adminUpdate(`/approve ${id}`),
-      }),
-      env,
-      ctx,
-    );
-    expect(res.status).toBe(200);
-    await waitOnExecutionContext(ctx);
+    // The webhook only enqueues the /approve command and ACKs; the command runs in
+    // the DO's alarm. Enqueue through the DO's Telegram inbox, disarm the alarm the
+    // webhook auto-armed (the harness would otherwise auto-deliver it and race us),
+    // then drain the inbox deterministically with one alarm() pass.
+    const adminId = Number(env.ADMIN_TELEGRAM_ID);
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName('cato3-primary'));
+    await runInDurableObject(stub, async (instance: CatoAgent, state: DurableObjectState) => {
+      const body = JSON.stringify({
+        update_id: 700001,
+        message: { from: { id: adminId }, chat: { id: adminId }, text: `/approve ${id}` },
+      });
+      const res = await instance.fetch(
+        new Request('https://agent.internal/telegram', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+        }),
+      );
+      expect(res.status).toBe(200);
+      await state.storage.deleteAlarm();
+    });
+    await runInDurableObject(stub, async (instance: CatoAgent) => {
+      await (instance as unknown as { alarm(): Promise<void> }).alarm();
+    });
 
     // The reply message reports the grant (earlier sendMessage calls are the
     // proposal notification from propose_ddl — take the latest)

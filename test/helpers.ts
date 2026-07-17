@@ -1,5 +1,6 @@
-import { env } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { vi } from 'vitest';
+import type { CatoAgent } from '../src/agent';
 
 // Same derivation as src/index.ts webhookSecret().
 export async function deriveSecret(adminToken: string): Promise<string> {
@@ -18,6 +19,19 @@ export function adminUpdate(text: string): string {
 export interface TelegramCall {
   url: string;
   body: Record<string, unknown>;
+}
+
+// pool-workers persists DO storage across test runs, and update_ids are reused
+// across runs, so a re-run's "first delivery" would collide with a leftover row
+// and be treated as a duplicate. Clear the inbox (and, optionally, event_log) for
+// a DO before a test that inserts a known update_id and inspects the result.
+export async function clearInbox(name = 'cato3-primary', alsoEventLog = false): Promise<void> {
+  const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName(name));
+  await runInDurableObject(stub, async (instance: CatoAgent, state: DurableObjectState) => {
+    await (instance as unknown as { initialize(): Promise<void> }).initialize();
+    state.storage.sql.exec('DELETE FROM telegram_updates').toArray();
+    if (alsoEventLog) state.storage.sql.exec('DELETE FROM event_log').toArray();
+  });
 }
 
 // The main worker (and its DO) run in the same isolate as tests, so stubbing

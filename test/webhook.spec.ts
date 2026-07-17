@@ -1,7 +1,11 @@
-import { createExecutionContext, env, SELF, waitOnExecutionContext } from 'cloudflare:test';
+import { createExecutionContext, env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
+import type { CatoAgent } from '../src/agent';
 import type { Env } from '../src/types';
+import { clearInbox } from './helpers';
+
+type AgentAlarm = { alarm(): Promise<void> };
 
 // Same derivation as src/index.ts webhookSecret().
 async function deriveSecret(adminToken: string): Promise<string> {
@@ -77,28 +81,49 @@ describe('POST /webhook/telegram authentication', () => {
     expect(telegramCalls).toHaveLength(0);
   });
 
-  it('acks instantly (empty 200) and forwards the admin command to the agent in the background', async () => {
-    // The webhook no longer carries the reply in its HTTP body: it ACKs Telegram
-    // immediately and processes in the background via ctx.waitUntil, so Telegram
-    // never times out and redelivers. Drive worker.fetch directly with an
-    // ExecutionContext so the background task is observable via waitOnExecutionContext.
-    const ctx = createExecutionContext();
-    const res = await worker.fetch(
-      new Request('https://example.com/webhook/telegram', {
-        method: 'POST',
-        headers: { 'X-Telegram-Bot-Api-Secret-Token': await deriveSecret(env.ADMIN_TOKEN) },
-        body: adminUpdate('/models'),
+  it('enqueues the admin command and ACKs an empty 200 with no synchronous LLM/Telegram work; the alarm drains it', async () => {
+    // The webhook now only enqueues: it dedups + writes an inbox row and returns
+    // fast, doing no LLM work and sending no Telegram message on the request path.
+    // The DO's alarm() drains the inbox and delivers the reply out-of-band. This is
+    // the fix for the ~30s waitUntil cancellation that could kill long turns.
+    await clearInbox('cato3-primary');
+    const adminId = Number(env.ADMIN_TELEGRAM_ID);
+    const updateId = 910001;
+    const res = await SELF.fetch('https://example.com/webhook/telegram', {
+      method: 'POST',
+      headers: { 'X-Telegram-Bot-Api-Secret-Token': await deriveSecret(env.ADMIN_TOKEN) },
+      body: JSON.stringify({
+        update_id: updateId,
+        message: { from: { id: adminId }, chat: { id: adminId }, text: '/models' },
       }),
-      env,
-      ctx,
-    );
+    });
+    // Snapshot the Telegram-call count synchronously at ACK, before any await lets
+    // the harness auto-deliver the now-alarm. The webhook did no Telegram work on
+    // the request path — it only enqueued.
+    const telegramAtAck = telegramCalls.length;
     expect(res.status).toBe(200);
     expect(await res.text()).toBe('');
-    // The DO delivers the /models reply via the Telegram API in the background —
-    // flush the waitUntil task, then prove the command surface was reached.
-    await waitOnExecutionContext(ctx);
-    expect(telegramCalls).toHaveLength(1);
-    expect(telegramCalls[0].url).toContain('sendMessage');
+    expect(telegramAtAck).toBe(0);
+
+    // The update was written to the inbox for the alarm to drain. Then drop the
+    // auto-armed alarm and drain deterministically (idempotent if the harness
+    // already auto-fired it): the /models reply is delivered and the row is done.
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName('cato3-primary'));
+    const enqueuedRow = await runInDurableObject(stub, async (instance: CatoAgent, state: DurableObjectState) => {
+      const row = state.storage.sql
+        .exec('SELECT update_id FROM telegram_updates WHERE update_id = ?', updateId)
+        .toArray();
+      await state.storage.deleteAlarm();
+      await (instance as unknown as AgentAlarm).alarm();
+      return row;
+    });
+    expect(enqueuedRow).toHaveLength(1);
+    expect(telegramCalls.some((c) => c.url.includes('sendMessage'))).toBe(true);
+
+    const done = await runInDurableObject(stub, async (_i: CatoAgent, state: DurableObjectState) =>
+      state.storage.sql.exec('SELECT status FROM telegram_updates WHERE update_id = ?', updateId).toArray(),
+    );
+    expect(done[0]['status']).toBe('done');
   });
 
   it('fails closed when ADMIN_TOKEN is unset', async () => {

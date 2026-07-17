@@ -132,15 +132,14 @@ export default {
         body: JSON.stringify(body),
         redirect: 'manual',
       });
-      // Async ACK: Telegram's webhook has a short patience window, and the DO runs
-      // the full LLM loop (up to 10 rounds, 60s/model call) before its response
-      // returns. A slow turn would make Telegram time out and REDELIVER the same
-      // update. The reply is not carried in this HTTP body anyway — the DO delivers
-      // it via its own outbound sendTelegramMessage call — so we ACK instantly and
-      // let the DO process in the background. The DO-level update_id dedup makes a
-      // redelivery that still slips through a no-op.
-      ctx.waitUntil(agent.fetch(forwarded));
-      return new Response('', { status: 200 });
+      // Fast ACK by design, without ctx.waitUntil. The DO's /telegram handler only
+      // enqueues the update (INSERT OR IGNORE into telegram_updates) and arms an
+      // alarm, then returns 200 — no LLM work on this path. The actual turn runs in
+      // the DO's alarm(), which gets full execution time and at-least-once retry
+      // accounting. waitUntil is the wrong tool here: Cloudflare cancels unfinished
+      // waitUntil work ~30s after the response, which would kill long LLM turns
+      // mid-flight and, with insert-before-process dedup, silently lose the command.
+      return agent.fetch(forwarded);
     }
 
     // Admin-only HTTP surface: privileged read / exec / mutate endpoints.

@@ -266,17 +266,219 @@ export class CatoAgent {
     return 'Error: tool call loop exceeded maximum rounds.';
   }
 
+  // Derive the actor from a stored update, mirroring the Worker's edge resolution
+  // (src/index.ts resolveActorFromTelegram). The Worker already dropped non-admin
+  // senders before forwarding, so payloads that reach the inbox resolve to admin;
+  // re-deriving here keeps the alarm self-contained (no request headers to read).
+  private resolveActorFromUpdate(body: TelegramUpdate): Actor {
+    const userId = body.message?.from?.id ?? body.edited_message?.from?.id;
+    if (!userId) return { id: 'telegram:unknown', role: 'user' };
+    const id = `telegram:${userId}`;
+    const role = String(userId) === this.env.ADMIN_TELEGRAM_ID ? 'admin' : 'user';
+    return { id, role };
+  }
+
+  // Process one update: run the admin command or the LLM loop and deliver the
+  // reply over Telegram. Non-text / non-message updates are no-ops. Errors are NOT
+  // caught here — they propagate to the alarm's per-row handler, which increments
+  // attempts and retries, then quarantines the update after 3 tries. Swallowing an
+  // LLM failure here would mark the update handled when it was not.
+  private async processUpdate(body: TelegramUpdate, actor: Actor): Promise<void> {
+    const message = body.message ?? body.edited_message;
+    if (!message?.text) return; // non-text or non-message update — nothing to do
+
+    const text = message.text.trim();
+    const chatId = message.chat.id;
+
+    // Command: /approve with no argument — list pending so user can copy a full command
+    if (/^\/approve\s*$/i.test(text) || /^\/deny\s*$/i.test(text)) {
+      if (actor.role !== 'admin') return;
+      const pending = listPendingApprovals(this.sql);
+      if (pending.length === 0) {
+        await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, 'No pending approvals.');
+      } else {
+        const lines = pending.map((p) =>
+          `<code>/approve ${p.id}</code>  —  ${p.sql_text.slice(0, 60)}…`
+        ).join('\n');
+        await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Pending approvals:\n\n${lines}\n\nCopy and send a command above to approve.`);
+      }
+      return;
+    }
+
+    // Command: /approve <id>
+    const approveMatch = text.match(/^\/approve\s+(\S+)/i);
+    if (approveMatch) {
+      if (actor.role !== 'admin') {
+        this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'approval_deny', payload: { id: approveMatch[1] }, outcome: 'failure', errorMessage: 'Not admin' });
+        return;
+      }
+      const result = processApproval(this.sql, approveMatch[1], 'granted', actor.id, (sql) =>
+        this.executeApprovedDDL(sql, approveMatch[1], actor)
+      );
+      if (result.ok) {
+        this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'approval_grant', payload: { id: approveMatch[1] }, outcome: 'success' });
+        await this.refreshManifest();
+      }
+      await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, result.message);
+      return;
+    }
+
+    // Command: /deny <id>
+    const denyMatch = text.match(/^\/deny\s+(\S+)/i);
+    if (denyMatch) {
+      if (actor.role !== 'admin') return;
+      const result = processApproval(this.sql, denyMatch[1], 'denied', actor.id, () => {});
+      if (result.ok) {
+        this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'approval_deny', payload: { id: denyMatch[1] }, outcome: 'success' });
+      }
+      await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, result.message);
+      return;
+    }
+
+    // Command: /model <slug>
+    const modelMatch = text.match(/^\/model\s+(\S+)/i);
+    if (modelMatch) {
+      if (actor.role !== 'admin') return;
+      const slug = modelMatch[1];
+      const rows = this.sql.exec(`SELECT slug FROM model_registry WHERE slug = ? AND role != 'disabled'`, slug).toArray();
+      if (rows.length === 0) {
+        await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Model '${slug}' not found or disabled. Use /models to list available models.`);
+        return;
+      }
+      this.sql.exec(`UPDATE active_model SET primary_slug = ?, set_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), set_by = ? WHERE singleton = 1`, slug, actor.id).toArray();
+      this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { action: 'model_switch', new_model: slug }, outcome: 'success' });
+      await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Primary model switched to <code>${slug}</code>.`);
+      return;
+    }
+
+    // Command: /models
+    if (text === '/models') {
+      if (actor.role !== 'admin') return;
+      const models = this.sql.exec(`SELECT slug, role, notes FROM model_registry ORDER BY role, slug`).toArray() as Array<Record<string, unknown>>;
+      const list = models.map(m => `• <b>${m['slug']}</b> [${m['role']}]${m['notes'] ? ` — ${m['notes']}` : ''}`).join('\n');
+      await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Available models:\n\n${list}`);
+      return;
+    }
+
+    // Command: /refresh
+    if (text === '/refresh') {
+      if (actor.role !== 'admin') return;
+      await this.refreshManifest();
+      await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, 'Schema manifest refreshed.');
+      return;
+    }
+
+    // Regular message — run the LLM loop. A throw here propagates to the alarm's
+    // per-row catch (retry/quarantine), so we log pending → success but leave the
+    // failure path to the alarm.
+    this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'invoke', payload: { source: 'telegram', text }, outcome: 'pending' });
+    const reply = await this.runLLMLoop(text, actor);
+    this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'invoke', payload: { source: 'telegram' }, outcome: 'success' });
+    await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, reply);
+  }
+
+  // Drain the Telegram inbox: process every pending row, oldest update_id first.
+  private async processInbox(): Promise<void> {
+    const rows = this.sql.exec(
+      `SELECT update_id, payload FROM telegram_updates WHERE status = 'pending' ORDER BY update_id`
+    ).toArray() as Array<Record<string, unknown>>;
+
+    for (const row of rows) {
+      const updateId = Number(row['update_id']);
+      const rawPayload = row['payload'];
+
+      // Per-row try/catch is load-bearing: the alarm() invocation itself must NOT
+      // throw. If it did, workerd would roll back EVERY SQL write this alarm made
+      // (including the attempts increment below) at the output gate, then re-run the
+      // alarm on its own schedule with no record that we already tried. Catching
+      // here keeps the bookkeeping durable. The trade-off, accepted deliberately: a
+      // failed attempt's partial side effects (a half-finished LLM turn, a message
+      // already sent) are not rolled back, so a retry may repeat model actions.
+      // These are at-least-once semantics, not exactly-once.
+      try {
+        if (typeof rawPayload !== 'string') {
+          // No stored payload (e.g. a migrated legacy row) — cannot replay. Retire it.
+          this.sql.exec(
+            `UPDATE telegram_updates SET status = 'done', processed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE update_id = ?`,
+            updateId
+          ).toArray();
+          continue;
+        }
+        const body = JSON.parse(rawPayload) as TelegramUpdate;
+        const actor = this.resolveActorFromUpdate(body);
+        await this.processUpdate(body, actor);
+        this.sql.exec(
+          `UPDATE telegram_updates SET status = 'done', processed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE update_id = ?`,
+          updateId
+        ).toArray();
+      } catch (err) {
+        this.sql.exec(
+          `UPDATE telegram_updates SET attempts = attempts + 1 WHERE update_id = ?`,
+          updateId
+        ).toArray();
+        const attemptsRows = this.sql.exec(
+          `SELECT attempts FROM telegram_updates WHERE update_id = ?`,
+          updateId
+        ).toArray();
+        const attempts = attemptsRows.length > 0 ? Number((attemptsRows[0] as Record<string, unknown>)['attempts']) : 0;
+        if (attempts >= 3) {
+          this.sql.exec(
+            `UPDATE telegram_updates SET status = 'failed', processed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE update_id = ?`,
+            updateId
+          ).toArray();
+          this.logEvent({
+            actor: 'system:alarm',
+            actorRole: 'system',
+            eventType: 'telegram_update_failed',
+            payload: { update_id: updateId, attempts },
+            outcome: 'failure',
+            errorMessage: String(err),
+          });
+        }
+        // attempts < 3: leave pending; the alarm reschedules a retry. A poison row
+        // never blocks later rows — the loop continues to the next update.
+      }
+    }
+  }
+
+  // Single alarm slot, three jobs: drain the Telegram inbox, sweep expired
+  // approvals, and age out old dedup rows. Reschedule to whichever job needs the
+  // sooner wake-up.
   async alarm(): Promise<void> {
+    await this.initialize();
+
+    // Approval TTL sweep.
     const swept = sweepExpired(this.sql);
     if (swept > 0) {
       this.logEvent({ actor: 'system:alarm', actorRole: 'system', eventType: 'tool_call', payload: { swept_count: swept }, outcome: 'success' });
     }
-    // If there are still pending items, set another alarm
-    const stillPending = this.sql.exec(`SELECT COUNT(*) as n FROM approval_pending WHERE status = 'pending'`).toArray();
-    const count = stillPending.length > 0 ? Number((stillPending[0] as Record<string, unknown>)['n']) : 0;
-    if (count > 0) {
-      await this.ctx.storage.setAlarm(Date.now() + 60 * 60 * 1000);
+
+    // Age out resolved dedup rows (keep pending ones — they are the live queue).
+    this.sql.exec(
+      `DELETE FROM telegram_updates WHERE status IN ('done', 'failed') AND seen_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')`
+    ).toArray();
+
+    // Drain the inbox.
+    await this.processInbox();
+
+    // Reschedule. Inbox rows still pending (attempts < 3) → retry in 30s. Pending
+    // approvals → keep the 1h TTL sweep. One alarm slot, so wake at the earlier time.
+    let next: number | null = null;
+    const pendingInbox = this.sql.exec(
+      `SELECT COUNT(*) AS n FROM telegram_updates WHERE status = 'pending' AND attempts < 3`
+    ).toArray();
+    const inboxCount = pendingInbox.length > 0 ? Number((pendingInbox[0] as Record<string, unknown>)['n']) : 0;
+    if (inboxCount > 0) next = Date.now() + 30_000;
+
+    const pendingApprovals = this.sql.exec(
+      `SELECT COUNT(*) AS n FROM approval_pending WHERE status = 'pending'`
+    ).toArray();
+    const approvalCount = pendingApprovals.length > 0 ? Number((pendingApprovals[0] as Record<string, unknown>)['n']) : 0;
+    if (approvalCount > 0) {
+      const approvalNext = Date.now() + 60 * 60 * 1000;
+      next = next === null ? approvalNext : Math.min(next, approvalNext);
     }
+    if (next !== null) await this.ctx.storage.setAlarm(next);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -284,121 +486,54 @@ export class CatoAgent {
     const url = new URL(request.url);
     const actor = resolveActor(request, this.env);
 
-    // --- Telegram ---
+    // --- Telegram (enqueue only) ---
+    // The webhook handler does no LLM work and sends no Telegram message. It dedups
+    // and enqueues the update, arms the drain alarm, and returns immediately. The
+    // alarm() handler drains telegram_updates and runs the actual turn. This keeps
+    // the HTTP response fast (Telegram never times out and redelivers) while giving
+    // long LLM turns full execution time and at-least-once retry accounting — which
+    // ctx.waitUntil, cancelled ~30s after the response, could not.
     if (request.method === 'POST' && url.pathname === '/telegram') {
       const body = await request.json<TelegramUpdate>();
 
-      // Webhook redelivery dedup. Telegram re-delivers when the webhook answers
-      // slowly (long LLM turns exceed its patience). Insert-before-processing =
-      // at-most-once: a concurrent redelivery sees the row and skips instead of
-      // running the whole LLM loop twice. No await inside this block, so the DO's
-      // single-threaded execution makes the SELECT+INSERT atomic.
-      if (typeof body.update_id === 'number') {
-        const dup = this.sql.exec(
-          `SELECT 1 AS x FROM telegram_updates WHERE update_id = ?`, body.update_id
-        ).toArray();
-        if (dup.length > 0) return Response.json({ ok: true, deduplicated: true });
-        this.sql.exec(`INSERT INTO telegram_updates (update_id) VALUES (?)`, body.update_id).toArray();
-        this.sql.exec(
-          `DELETE FROM telegram_updates WHERE seen_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')`
-        ).toArray();
+      // Telegram always sends a numeric update_id. Without one there is no dedup
+      // key and nothing to enqueue against; ACK and drop rather than guess.
+      if (typeof body.update_id !== 'number') {
+        return new Response('', { status: 200 });
       }
 
-      const message = body.message ?? body.edited_message;
-      if (!message?.text) return Response.json({ ok: true });
+      const msg = body.message ?? body.edited_message;
+      const chatId = msg?.chat?.id ?? null;
+      const text = msg?.text ?? null;
 
-      const text = message.text.trim();
-      const chatId = message.chat.id;
-
-      // Command: /approve with no argument — list pending so user can copy a full command
-      if (/^\/approve\s*$/i.test(text) || /^\/deny\s*$/i.test(text)) {
-        if (actor.role !== 'admin') return Response.json({ ok: true });
-        const pending = listPendingApprovals(this.sql);
-        if (pending.length === 0) {
-          await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, 'No pending approvals.');
-        } else {
-          const lines = pending.map((p) =>
-            `<code>/approve ${p.id}</code>  —  ${p.sql_text.slice(0, 60)}…`
-          ).join('\n');
-          await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Pending approvals:\n\n${lines}\n\nCopy and send a command above to approve.`);
-        }
-        return Response.json({ ok: true });
+      // Dedup + enqueue in one step. INSERT OR IGNORE makes the dedup table the
+      // work queue: a first delivery inserts a pending row; a redelivery of the
+      // same update_id conflicts on the primary key and is ignored (rowsWritten
+      // stays 0). The DO is single-threaded and there is no await before the
+      // rowsWritten read, so the accept/skip decision is atomic. payload carries
+      // the full update so the alarm can process it without re-receiving.
+      const cursor = this.sql.exec(
+        `INSERT OR IGNORE INTO telegram_updates (update_id, chat_id, text, payload) VALUES (?, ?, ?, ?)`,
+        body.update_id,
+        chatId,
+        text,
+        JSON.stringify(body)
+      );
+      cursor.toArray();
+      const enqueued = cursor.rowsWritten > 0;
+      if (!enqueued) {
+        // Duplicate update_id — already accepted. Nothing to enqueue.
+        return new Response('', { status: 200 });
       }
 
-      // Command: /approve <id>
-      const approveMatch = text.match(/^\/approve\s+(\S+)/i);
-      if (approveMatch) {
-        if (actor.role !== 'admin') {
-          this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'approval_deny', payload: { id: approveMatch[1] }, outcome: 'failure', errorMessage: 'Not admin' });
-          return Response.json({ ok: true });
-        }
-        const result = processApproval(this.sql, approveMatch[1], 'granted', actor.id, (sql) =>
-          this.executeApprovedDDL(sql, approveMatch[1], actor)
-        );
-        if (result.ok) {
-          this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'approval_grant', payload: { id: approveMatch[1] }, outcome: 'success' });
-          await this.refreshManifest();
-        }
-        await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, result.message);
-        return Response.json({ ok: true });
+      // Arm the drain alarm. If none is set, or one is scheduled for the future
+      // (e.g. the 1h approval TTL sweep), pull it forward to now so the update is
+      // processed within milliseconds. Command latency is therefore unaffected.
+      const cur = await this.ctx.storage.getAlarm();
+      if (cur === null || cur > Date.now()) {
+        await this.ctx.storage.setAlarm(Date.now());
       }
-
-      // Command: /deny <id>
-      const denyMatch = text.match(/^\/deny\s+(\S+)/i);
-      if (denyMatch) {
-        if (actor.role !== 'admin') return Response.json({ ok: true });
-        const result = processApproval(this.sql, denyMatch[1], 'denied', actor.id, () => {});
-        if (result.ok) {
-          this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'approval_deny', payload: { id: denyMatch[1] }, outcome: 'success' });
-        }
-        await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, result.message);
-        return Response.json({ ok: true });
-      }
-
-      // Command: /model <slug>
-      const modelMatch = text.match(/^\/model\s+(\S+)/i);
-      if (modelMatch) {
-        if (actor.role !== 'admin') return Response.json({ ok: true });
-        const slug = modelMatch[1];
-        const rows = this.sql.exec(`SELECT slug FROM model_registry WHERE slug = ? AND role != 'disabled'`, slug).toArray();
-        if (rows.length === 0) {
-          await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Model '${slug}' not found or disabled. Use /models to list available models.`);
-          return Response.json({ ok: true });
-        }
-        this.sql.exec(`UPDATE active_model SET primary_slug = ?, set_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), set_by = ? WHERE singleton = 1`, slug, actor.id).toArray();
-        this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { action: 'model_switch', new_model: slug }, outcome: 'success' });
-        await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Primary model switched to <code>${slug}</code>.`);
-        return Response.json({ ok: true });
-      }
-
-      // Command: /models
-      if (text === '/models') {
-        if (actor.role !== 'admin') return Response.json({ ok: true });
-        const models = this.sql.exec(`SELECT slug, role, notes FROM model_registry ORDER BY role, slug`).toArray() as Array<Record<string, unknown>>;
-        const list = models.map(m => `• <b>${m['slug']}</b> [${m['role']}]${m['notes'] ? ` — ${m['notes']}` : ''}`).join('\n');
-        await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Available models:\n\n${list}`);
-        return Response.json({ ok: true });
-      }
-
-      // Command: /refresh
-      if (text === '/refresh') {
-        if (actor.role !== 'admin') return Response.json({ ok: true });
-        await this.refreshManifest();
-        await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, 'Schema manifest refreshed.');
-        return Response.json({ ok: true });
-      }
-
-      // Regular message — run LLM
-      this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'invoke', payload: { source: 'telegram', text }, outcome: 'pending' });
-      try {
-        const reply = await this.runLLMLoop(text, actor);
-        this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'invoke', payload: { source: 'telegram' }, outcome: 'success' });
-        await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, reply);
-      } catch (err) {
-        this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'invoke', payload: { source: 'telegram' }, outcome: 'failure', errorMessage: String(err) });
-        await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, chatId, `Error: ${String(err)}`);
-      }
-      return Response.json({ ok: true });
+      return new Response('', { status: 200 });
     }
 
     // --- HTTP: /invoke ---
