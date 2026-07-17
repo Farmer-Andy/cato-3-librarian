@@ -4,8 +4,7 @@
 
 Please report security issues privately, not through a public issue or pull request.
 
-- Email `security@<yourdomain>` with a description, reproduction steps, and impact. **Operator: replace `<yourdomain>` with a real contact address before publishing this repo.**
-- Or open a private report through GitHub Security Advisories: the repository's **Security** tab, then **Report a vulnerability**.
+Use GitHub's private vulnerability reporting. Open the repository's **Security** tab and click **Report a vulnerability**. That files a private security advisory visible only to the maintainers. Include a description, reproduction steps, and the impact you observed.
 
 Please allow a reasonable window for a fix before any public disclosure.
 
