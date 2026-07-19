@@ -104,7 +104,9 @@ export class CatoAgent {
           return `Error: query tool only accepts read SQL. Detected classification: ${classification}. Use 'write' for writes or 'propose_ddl' for DDL.`;
         }
         try {
-          const CAP = 200;
+          const CAP = 200;              // max rows
+          const MAX_CELL = 2000;        // max chars per string value
+          const MAX_BYTES = 64 * 1024;  // max total serialized size
           // Iterate the cursor and stop at the cap instead of .toArray()
           // materializing every row first: a huge SELECT would otherwise exhaust
           // memory/time before the slice. Early-breaking a READ cursor is safe —
@@ -113,15 +115,33 @@ export class CatoAgent {
           // apply here. This is the one sanctioned exception to that rule.
           const cursor = this.sql.exec(sql);
           const rows: Record<string, unknown>[] = [];
-          let truncated = false;
-          for (const row of cursor) {
-            if (rows.length >= CAP) { truncated = true; break; }
-            rows.push(row as Record<string, unknown>);
+          let truncated: 'rows' | 'bytes' | null = null;
+          let bytes = 0;
+          for (const raw of cursor) {
+            if (rows.length >= CAP) { truncated = 'rows'; break; }
+            // Per-cell cap: one huge TEXT value can blow the LLM context on its
+            // own, so clamp any oversized string before it counts toward budget.
+            const row = raw as Record<string, unknown>;
+            const clamped: Record<string, unknown> = {};
+            for (const [k, v] of Object.entries(row)) {
+              clamped[k] = typeof v === 'string' && v.length > MAX_CELL
+                ? `${v.slice(0, MAX_CELL)}… [truncated, ${v.length} chars total]`
+                : v;
+            }
+            // Total budget: accumulate the serialized size as rows stream and
+            // stop once it crosses the cap. Keep at least one row so a single
+            // wide row still returns something.
+            bytes += JSON.stringify(clamped).length;
+            if (bytes > MAX_BYTES && rows.length > 0) { truncated = 'bytes'; break; }
+            rows.push(clamped);
           }
           const body = JSON.stringify(rows, null, 2);
-          const result = truncated
-            ? `${body}\n\n[Result truncated: showing the first ${CAP} rows. Add a WHERE filter or LIMIT to narrow the result.]`
-            : body;
+          let result = body;
+          if (truncated === 'rows') {
+            result = `${body}\n\n[Result truncated: showing the first ${CAP} rows. Add a WHERE filter or LIMIT to narrow the result.]`;
+          } else if (truncated === 'bytes') {
+            result = `${body}\n\n[Result truncated: stopped at the ${MAX_BYTES / 1024}KB output budget after ${rows.length} rows. Add a WHERE filter or LIMIT to narrow the result.]`;
+          }
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'query', sql }, outcome: 'success' });
           return result;
         } catch (err) {
