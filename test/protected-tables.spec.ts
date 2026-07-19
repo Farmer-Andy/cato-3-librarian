@@ -109,7 +109,7 @@ describe('write tool protected-table guard (real DO)', () => {
       state.storage.sql.exec('CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)').toArray();
 
       const result = await internals.executeTool('write', { sql: "INSERT INTO notes (body) VALUES ('kept')", rationale: 'test' }, admin);
-      expect(result).toBe('Write executed successfully.');
+      expect(result).toBe('Write executed successfully (1 row modified).');
 
       const rows = state.storage.sql.exec('SELECT body FROM notes').toArray();
       expect(rows).toEqual([{ body: 'kept' }]);

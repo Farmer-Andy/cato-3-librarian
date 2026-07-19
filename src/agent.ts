@@ -178,8 +178,24 @@ export class CatoAgent {
           // Consume the cursor: DO SQLite cursors are lazy and the write may
           // otherwise not execute in production despite being logged as success.
           this.sql.exec(sql).toArray();
-          this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'write', sql, rationale }, outcome: 'success' });
-          return 'Write executed successfully.';
+          // Logical affected-row count comes from changes(), NOT the exec cursor's
+          // rowsWritten: on a table with a secondary index rowsWritten inflates —
+          // it counts index-entry writes on top of table rows (a single-row INSERT
+          // reports 2, a 3-row UPDATE reports 6). changes() is the true count in
+          // every case. See test/rows-written-probe.spec.ts for the measurement.
+          const rowsModified = Number((this.sql.exec('SELECT changes() AS n').toArray()[0] as { n: number }).n);
+          this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'write', sql, rationale, rows_written: rowsModified }, outcome: 'success' });
+          // A zero-row UPDATE/DELETE is SQLite-"successful" but changed nothing
+          // (e.g. a fabricated id in the WHERE clause). Return a WARNING the model
+          // cannot read as success, so it never reports a no-op as done. Live
+          // incident: the model "closed tasks" via UPDATEs with fabricated ids —
+          // zero rows matched, the tool said success, and it told the operator the
+          // work was done.
+          const verb = sql.trim().match(/^([A-Za-z]+)/)?.[1]?.toUpperCase() ?? '';
+          if (rowsModified === 0 && (verb === 'UPDATE' || verb === 'DELETE')) {
+            return 'WARNING: write executed but modified 0 rows — nothing changed. The WHERE clause matched no rows. Do not report this as done; re-check the target with a fresh query first.';
+          }
+          return `Write executed successfully (${rowsModified} row${rowsModified === 1 ? '' : 's'} modified).`;
         } catch (err) {
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'write', sql, rationale }, outcome: 'failure', errorMessage: String(err) });
           return `Error executing write: ${String(err)}`;
