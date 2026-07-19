@@ -1,0 +1,9 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`probe: DO SQLite rollback vs outbound-fetch commit points > measures which writes survive a thrown event 1`] = `
+[
+  "clean",
+  "control",
+  "post_fetch",
+]
+`;
