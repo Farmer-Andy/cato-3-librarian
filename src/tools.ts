@@ -7,8 +7,32 @@ const DDL_KEYWORDS = new Set(['CREATE', 'ALTER', 'DROP', 'REINDEX', 'VACUUM']);
 const WRITE_KEYWORDS = new Set(['INSERT', 'UPDATE', 'DELETE', 'REPLACE', 'UPSERT']);
 const READ_KEYWORDS = new Set(['SELECT', 'WITH', 'PRAGMA', 'EXPLAIN', 'VALUES']);
 
+// Detect a multi-statement string: a `;` followed by any further non-whitespace
+// content (a trailing semicolon is fine). Comments and string literals are
+// neutralized first, so a `;` inside a quoted value never counts.
+//
+// WHY this matters: production DO SQLite silently executes only the FIRST
+// statement of a multi-statement exec and drops the rest. `SELECT 1; UPDATE t
+// SET c=2` runs the harmless SELECT while the UPDATE vanishes with no error —
+// yet an admin approving DDL sees BOTH statements and the audit records the whole
+// string as executed. That display-vs-execute gap is a correctness/honesty hole.
+// Explicit policy beats runtime-dependent behavior, so classifySQL refuses
+// multi-statement input outright rather than leaning on the engine to drop the
+// tail (which could change between engine versions).
+export function hasMultipleStatements(sql: string): boolean {
+  const stripped = stripCommentsAndStrings(sql);
+  const firstSemi = stripped.indexOf(';');
+  if (firstSemi === -1) return false;
+  return /\S/.test(stripped.slice(firstSemi + 1));
+}
+
 export function classifySQL(sql: string): SQLClass {
   const stripped = stripCommentsAndStrings(sql);
+  // Single choke point: multi-statement input is 'unknown'. Because the query
+  // tool requires 'read', the write tool's strict gate requires 'write', and
+  // propose_ddl requires 'ddl', classifying multi-statement as 'unknown' makes
+  // all three paths reject it — see hasMultipleStatements for why.
+  if (hasMultipleStatements(sql)) return 'unknown';
   const firstKeyword = extractFirstKeyword(stripped);
   if (!firstKeyword) return 'unknown';
   if (DDL_KEYWORDS.has(firstKeyword)) return 'ddl';

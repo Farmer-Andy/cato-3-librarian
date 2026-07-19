@@ -1,6 +1,6 @@
 import { env, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
-import { classifySQL, isUnsafeWrite } from '../src/tools';
+import { classifySQL, isUnsafeWrite, hasMultipleStatements } from '../src/tools';
 import type { CatoAgent } from '../src/agent';
 import type { Actor } from '../src/types';
 
@@ -89,6 +89,34 @@ describe('classifySQL', () => {
   });
 });
 
+describe('multi-statement rejection', () => {
+  it('classifies a multi-statement string as unknown', () => {
+    // DO SQLite would run only `SELECT 1` and silently drop the UPDATE.
+    expect(classifySQL('SELECT 1; UPDATE t SET c = 2')).toBe('unknown');
+  });
+
+  it('allows a single trailing semicolon', () => {
+    expect(classifySQL('SELECT 1;')).toBe('read');
+  });
+
+  it('does not count a semicolon inside a string literal', () => {
+    expect(classifySQL("SELECT ';'")).toBe('read');
+  });
+
+  it('classifies a multi-statement DDL string as unknown (propose_ddl would refuse it)', () => {
+    // Admin sees two CREATEs; DO SQLite would run only the first. Classified
+    // 'unknown', propose_ddl (which requires 'ddl') rejects the whole string.
+    expect(classifySQL('CREATE TABLE a (id INTEGER); CREATE TABLE b (id INTEGER)')).toBe('unknown');
+  });
+
+  it('hasMultipleStatements detects trailing content vs a bare trailing semicolon', () => {
+    expect(hasMultipleStatements('SELECT 1; UPDATE t SET c = 2')).toBe(true);
+    expect(hasMultipleStatements('SELECT 1;')).toBe(false);
+    expect(hasMultipleStatements('SELECT 1')).toBe(false);
+    expect(hasMultipleStatements("SELECT ';'")).toBe(false);
+  });
+});
+
 describe('isUnsafeWrite', () => {
   it('rejects DELETE/UPDATE with no WHERE', () => {
     expect(isUnsafeWrite('DELETE FROM t')).toBe(true);
@@ -156,6 +184,31 @@ describe('query tool boundary (real DO SQLite)', () => {
 
       const rows = state.storage.sql.exec('SELECT COUNT(*) AS n FROM probe').toArray();
       expect(rows[0]['n']).toBe(0);
+    });
+  });
+
+  it('rejects a multi-statement string end to end (DO SQLite would run only the first)', async () => {
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName('classifier-test-multi'));
+    await runInDurableObject(stub, async (instance: CatoAgent, state: DurableObjectState) => {
+      const internals = instance as unknown as AgentInternals;
+      await internals.initialize();
+      state.storage.sql.exec('CREATE TABLE IF NOT EXISTS probe (v INTEGER)').toArray();
+      state.storage.sql.exec('INSERT INTO probe (v) VALUES (1)').toArray();
+
+      // DO SQLite would execute only `SELECT 1` and silently drop the UPDATE. The
+      // classifier calls the whole string 'unknown', so the query tier refuses it
+      // before any statement runs.
+      const result = await internals.executeTool(
+        'query',
+        { sql: 'SELECT 1; UPDATE probe SET v = 2' },
+        admin
+      );
+      expect(result).toContain('query tool only accepts read SQL');
+      expect(result).toContain('unknown');
+
+      // The trailing UPDATE never ran.
+      const rows = state.storage.sql.exec('SELECT v FROM probe').toArray();
+      expect(rows).toEqual([{ v: 1 }]);
     });
   });
 
