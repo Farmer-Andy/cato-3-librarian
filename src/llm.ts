@@ -20,11 +20,11 @@ export async function callLLM(input: {
   let lastError = 'No model attempted';
 
   for (const model of models) {
-    try {
-      const controller = new AbortController();
-      // 60s: reasoning-tier default models (e.g. xiaomi/mimo-v2.5-pro) run long on tool turns; was 25s.
-      const timeoutId = setTimeout(() => controller.abort(), 60000);
+    const controller = new AbortController();
+    // 60s: reasoning-tier default models (e.g. xiaomi/mimo-v2.5-pro) run long on tool turns; was 25s.
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
 
+    try {
       const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -43,8 +43,6 @@ export async function callLLM(input: {
         }),
         signal: controller.signal,
       });
-
-      clearTimeout(timeoutId);
 
       if (!res.ok) {
         lastError = `Model ${model} returned ${res.status}`;
@@ -77,6 +75,11 @@ export async function callLLM(input: {
       } else {
         lastError = `Model ${model} threw: ${String(err)}`;
       }
+    } finally {
+      // Always clear the abort timer. A fetch that throws (or a non-ok/continue
+      // path) would otherwise leave it pending to fire later and abort an
+      // unrelated request on this isolate.
+      clearTimeout(timeoutId);
     }
   }
 
