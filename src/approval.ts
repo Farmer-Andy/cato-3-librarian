@@ -53,7 +53,13 @@ export function processApproval(
     return { ok: false, message: `Approval ${id} has expired` };
   }
 
-  // Flip to a transitional status to prevent TTL race
+  // Flip to a transitional status so the TTL sweep cannot expire a proposal
+  // mid-grant. Failure semantics: the whole transition (executing -> onGrant ->
+  // terminal status) is synchronous, and DO SQLite commits a request's writes
+  // together at the output-gate boundary, so a crash cannot leave a row
+  // stranded in 'executing' with the DDL half-applied. The only failure mode is
+  // onGrant throwing, which the catch below resets to 'pending' (retryable).
+  // No admin recovery path for a stuck 'executing' row is needed.
   sql.exec(`UPDATE approval_pending SET status = 'executing' WHERE id = ?`, id).toArray();
 
   if (action === 'granted') {

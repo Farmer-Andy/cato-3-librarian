@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Farmer-Andy/cato-3-librarian/actions/workflows/ci.yml/badge.svg)](https://github.com/Farmer-Andy/cato-3-librarian/actions/workflows/ci.yml)
 
-A deployable Cloudflare Workers + Durable Objects database agent. It owns its own Durable-Object-local SQLite database: you define your tables in `src/schema.ts`, deploy, and get a Telegram-accessible AI that can read, write, propose schema changes, and govern its own actions, all with an append-only audit trail and an admin approval gate on DDL.
+A deployable Cloudflare Workers + Durable Objects database agent. It owns its own Durable-Object-local SQLite database: you define your tables in `src/schema.ts`, deploy, and get a Telegram-accessible AI that can read, write, propose schema changes, and govern its own actions, all with an audit trail protected from model-issued SQL and an admin approval gate on DDL.
 
 This repo is the **base template**. Clone it, customize two files, deploy. That is the full workflow.
 
@@ -42,7 +42,7 @@ That gets you a running librarian over the default schema. To define your own ta
 
 ## What You Get Out of the Box
 
-- **AI database librarian.** Reads your schema on every invocation, answers accurately, and refuses to fabricate table or column names.
+- **AI database librarian.** Answers from a schema manifest that regenerates on boot and after every approved schema change, and refuses to fabricate table or column names.
 - **Tiered permissions.** Reads run free, writes are audited, and DDL requires admin approval over Telegram.
 - **Approval flow.** The agent proposes schema changes; an admin approves or denies with `/approve <id>` in Telegram. Unapproved requests expire after one hour.
 - **Eval suite.** 19 built-in tasks: 6 correctness and governance checks plus 13 adversarial gate-bypass probes. Run `POST /eval/run` for a score at any time.
@@ -59,7 +59,7 @@ Telegram / HTTP
 Edge Worker (src/index.ts)        ← stateless; actor resolution + auth
     ↓
 CatoAgent Durable Object          ← SQLite + LLM loop + tools
-  ├── event_log                   ← append-only audit trail
+  ├── event_log                   ← audit trail, guarded from model writes
   ├── approval_pending            ← DDL approval queue
   ├── model_registry / active_model
   ├── eval_tasks / eval_runs
@@ -395,7 +395,7 @@ The HTTP admin endpoints (`/manifest`, `/invoke`, `/eval/run`, `/eval/runs`, `/a
 
 Rotate `ADMIN_TOKEN` if it ever lands in a shell history, a log, or a screenshot. Tokens live in `.dev.vars` (gitignored) for local dev and in `wrangler secret` for production. Never commit them.
 
-**What "append-only audit trail" means here.** The agent's infrastructure tables (`event_log`, `approval_pending`, `model_registry`, `active_model`, `eval_tasks`, `eval_runs`, `mutations`, `skill_versions`, `_meta_comments`) are on a denylist in the tool layer: any LLM-issued `write` that targets them is rejected and the attempt itself is logged. The boundary of that guarantee: it protects against SQL issued through the agent's tools. Code with direct Durable Object access, and DDL you approve yourself through `propose_ddl`, can still modify these tables. It is a tool-layer control, not a database trigger or a separate write-only store.
+**What the audit trail guarantees.** Call it an application audit log protected from model-issued DML, not an append-only ledger. The agent's infrastructure tables (`event_log`, `approval_pending`, `model_registry`, `active_model`, `eval_tasks`, `eval_runs`, `mutations`, `skill_versions`, `_meta_comments`) are on a denylist in the tool layer: any LLM-issued `write` that targets them is rejected and the attempt itself is logged. The boundary of that guarantee: it protects against SQL issued through the agent's tools. Code with direct Durable Object access, and DDL you approve yourself through `propose_ddl`, can still modify these tables. It is a tool-layer control, not a database trigger or a separate write-only store. If forensic integrity matters for your deployment, export events to a separate store the agent cannot reach.
 
 ---
 
@@ -420,11 +420,11 @@ Rotate `ADMIN_TOKEN` if it ever lands in a shell history, a log, or a screenshot
 | **Write** | `INSERT`, `UPDATE`, `DELETE` with `WHERE` | Runs and is audit logged. Denied on protected infrastructure tables. |
 | **DDL** | `CREATE`, `ALTER`, `DROP` | Queued. Requires `/approve <id>`. |
 
-The SQL classifier runs server-side. If the agent tries to call `query` with a `DROP TABLE`, it is rejected with a tier mismatch error regardless of the tool name used. `WITH`-prefixed statements are classified by their top-level verb, so a CTE wrapped around an `INSERT` is a write, not a read. Assignment-form pragmas (`PRAGMA writable_schema = ON`) and anything else the classifier cannot place are rejected by every tool: the tiers are allowlists, not filters.
+The SQL classifier runs server-side. If the agent tries to call `query` with a `DROP TABLE`, it is rejected with a tier mismatch error regardless of the tool name used. `WITH`-prefixed statements are classified by their top-level verb, so a CTE wrapped around an `INSERT` is a write, not a read. Assignment-form pragmas (`PRAGMA writable_schema = ON`) and anything else the classifier cannot place are rejected by every tool: the tiers are allowlists, not filters. Multi-statement strings are rejected outright. Production DO SQLite silently runs only the first statement of a multi-statement string, and a policy that leaned on that quirk would let an approved DDL proposal display two statements while executing one.
 
-The `query` tier caps returned rows at 200. It reads the result cursor and stops at the cap rather than materializing the whole result first, so a `SELECT *` on a huge table can't exhaust memory. A truncated result carries a note telling the caller to add a `WHERE` filter or `LIMIT` to narrow it, which also keeps the model's context and token cost bounded.
+The `query` tier caps returned rows at 200, clips any single value longer than 2,000 characters, and stops at a 64KB output budget. It reads the result cursor and stops at the caps rather than materializing the whole result first, so a `SELECT *` on a huge table can't exhaust memory. A truncated result carries a note saying which limit was hit and telling the caller to add a `WHERE` filter or `LIMIT` to narrow it, which also keeps the model's context and token cost bounded.
 
-One known limit: the `WHERE` requirement on `UPDATE`/`DELETE` checks that a `WHERE` token is present, not that it constrains anything. `DELETE FROM t WHERE id = id` passes the guard and clears the table. Whole-table protection here is about preventing accidents, not adversarial SQL.
+Two known limits on the `WHERE` requirement for `UPDATE`/`DELETE`, which applies to the statement's top-level verb (CTE-wrapped writes included): the check confirms a `WHERE` token is present, not that it constrains anything, so `DELETE FROM t WHERE id = id` passes the guard and clears the table; and a `WHERE` inside a subquery after the verb (say, in a `SET` clause) also satisfies it. Whole-table protection here is about preventing accidents, not adversarial SQL. The same is true of the classifier as a whole: it is a keyword-level policy, not a SQL parser. If your deployment needs authority narrower than "any write to a non-protected table," replace the free-form `write` tool with typed domain tools in your derived deployment and protect the domain tables too. That derivation pattern is the recommended path for anything user-facing.
 
 ---
 
@@ -447,6 +447,9 @@ This is checkpoint 1: a deployable, governed database librarian. The following a
 - Digest agent and async summarization
 - Federation with other agents
 - Multi-tenant isolation
+- Idempotent command processing: an operation-id ledger so at-least-once Telegram redelivery can never repeat a write. Today a retried turn may re-run its writes; that trade-off is documented in `processInbox`.
+- Eval isolation: run the suite against a disposable Durable Object instead of the live database. Today the eval writes to `eval_scratch` on the live DB with side effects suppressed.
+- Typed domain capabilities: replace the free-form `write` tool with domain-specific tools in derived deployments (see Permission Model)
 
 The `mutations` and `skill_versions` tables are present but empty. They exist so the schema stays stable across that transition. Do not build the above from this template.
 
