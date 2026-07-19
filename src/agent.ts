@@ -185,15 +185,17 @@ export class CatoAgent {
           // every case. See test/rows-written-probe.spec.ts for the measurement.
           const rowsModified = Number((this.sql.exec('SELECT changes() AS n').toArray()[0] as { n: number }).n);
           this.logEvent({ actor: actor.id, actorRole: actor.role, eventType: 'tool_call', payload: { tool: 'write', sql, rationale, rows_written: rowsModified }, outcome: 'success' });
-          // A zero-row UPDATE/DELETE is SQLite-"successful" but changed nothing
-          // (e.g. a fabricated id in the WHERE clause). Return a WARNING the model
-          // cannot read as success, so it never reports a no-op as done. Live
-          // incident: the model "closed tasks" via UPDATEs with fabricated ids —
-          // zero rows matched, the tool said success, and it told the operator the
-          // work was done.
-          const verb = sql.trim().match(/^([A-Za-z]+)/)?.[1]?.toUpperCase() ?? '';
-          if (rowsModified === 0 && (verb === 'UPDATE' || verb === 'DELETE')) {
-            return 'WARNING: write executed but modified 0 rows — nothing changed. The WHERE clause matched no rows. Do not report this as done; re-check the target with a fresh query first.';
+          // A zero-row write is SQLite-"successful" but changed nothing (e.g. a
+          // fabricated id in the WHERE clause, or an INSERT whose conflict clause
+          // skipped every row). Return a WARNING the model cannot read as success,
+          // so it never reports a no-op as done. Live incident: the model "closed
+          // tasks" via UPDATEs with fabricated ids — zero rows matched, the tool
+          // said success, and it told the operator the work was done.
+          // Deliberately verb-unconditional: keying on the statement's first
+          // keyword would miss CTE-wrapped writes (WITH ... UPDATE), and a 0-row
+          // INSERT is the same no-op-reported-as-success hazard.
+          if (rowsModified === 0) {
+            return 'WARNING: write executed but modified 0 rows — nothing changed (a WHERE that matched nothing, or an INSERT whose conflict clause skipped every row). Do not report this as done; re-check the target with a fresh query first.';
           }
           return `Write executed successfully (${rowsModified} row${rowsModified === 1 ? '' : 's'} modified).`;
         } catch (err) {

@@ -100,4 +100,43 @@ describe('write tool reports rows modified (real DO)', () => {
       expect(lastToolCallPayload(sql).rows_written).toBe(0);
     });
   });
+
+  // The warning is verb-UNCONDITIONAL: a first-keyword check would miss
+  // CTE-wrapped writes (WITH ... UPDATE), and a 0-row INSERT is the same
+  // no-op-reported-as-success hazard.
+  it('a CTE-wrapped 0-row UPDATE and a 0-row INSERT both warn', async () => {
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName('rows-modified-zero-cte-insert'));
+    await runInDurableObject(stub, async (instance: CatoAgent, state: DurableObjectState) => {
+      const internals = instance as unknown as AgentInternals;
+      await internals.initialize();
+      const sql = state.storage.sql;
+
+      sql.exec('DROP TABLE IF EXISTS widgets').toArray();
+      sql.exec('CREATE TABLE widgets (id INTEGER PRIMARY KEY, status TEXT)').toArray();
+      sql.exec("INSERT INTO widgets (id, status) VALUES (1,'open')").toArray();
+
+      // CTE-wrapped fabricated-id UPDATE: classifies 'write' via classifyCTE,
+      // has a top-level WHERE (passes isUnsafeWrite), matches nothing.
+      const cte = await internals.executeTool('write', {
+        sql: "WITH target(tid) AS (SELECT 9999) UPDATE widgets SET status = 'done' WHERE id IN (SELECT tid FROM target)",
+        rationale: 't'
+      }, admin);
+      expect(cte).toContain('WARNING');
+      expect(cte).toContain('modified 0 rows');
+      expect(lastToolCallPayload(sql).rows_written).toBe(0);
+
+      // INSERT whose conflict clause skips the only row → 0 rows, must warn.
+      const ins = await internals.executeTool('write', {
+        sql: "INSERT OR IGNORE INTO widgets (id, status) VALUES (1,'dupe')",
+        rationale: 't'
+      }, admin);
+      expect(ins).toContain('WARNING');
+      expect(ins).toContain('modified 0 rows');
+      expect(lastToolCallPayload(sql).rows_written).toBe(0);
+
+      // Nothing changed in either case.
+      const rows = sql.exec('SELECT id, status FROM widgets ORDER BY id').toArray();
+      expect(rows).toEqual([{ id: 1, status: 'open' }]);
+    });
+  });
 });
