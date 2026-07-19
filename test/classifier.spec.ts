@@ -116,6 +116,27 @@ describe('isUnsafeWrite', () => {
     expect(isUnsafeWrite('INSERT INTO t VALUES (1)')).toBe(false);
     expect(isUnsafeWrite('SELECT 1')).toBe(false);
   });
+
+  it('flags CTE-wrapped UPDATE/DELETE with no WHERE as unsafe', () => {
+    // First keyword is WITH, but the top-level verb is a full-table write — the
+    // plain first-keyword check used to skip these entirely.
+    expect(isUnsafeWrite('WITH x AS (SELECT 1) UPDATE t SET c = 2')).toBe(true);
+    expect(isUnsafeWrite('WITH x AS (SELECT 1) DELETE FROM t')).toBe(true);
+  });
+
+  it('accepts a CTE-wrapped UPDATE/DELETE that carries a WHERE on the verb', () => {
+    expect(isUnsafeWrite('WITH x AS (SELECT 1) UPDATE t SET c = 2 WHERE id = 3')).toBe(false);
+  });
+
+  it('does not count a WHERE inside the CTE body as constraining the write', () => {
+    // The WHERE binds the CTE's SELECT, not the UPDATE — still a full-table write.
+    expect(isUnsafeWrite('WITH x AS (SELECT 1 FROM y WHERE a = 1) UPDATE t SET c = 2')).toBe(true);
+  });
+
+  it('ignores CTE-wrapped INSERT and SELECT (no WHERE requirement)', () => {
+    expect(isUnsafeWrite('WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x')).toBe(false);
+    expect(isUnsafeWrite('WITH x AS (SELECT 1) SELECT * FROM x')).toBe(false);
+  });
 });
 
 describe('query tool boundary (real DO SQLite)', () => {
@@ -201,6 +222,33 @@ describe('query tool boundary (real DO SQLite)', () => {
       // becomes the only thing standing between the agent and a silent write.
       expect(threw).toBe(true);
       expect(errText).toContain('SQLITE_AUTH');
+    });
+  });
+});
+
+describe('write tool boundary (real DO SQLite)', () => {
+  it('rejects a CTE-wrapped no-WHERE UPDATE like a plain no-WHERE UPDATE', async () => {
+    const stub = env.CATO_AGENT.get(env.CATO_AGENT.idFromName('classifier-test-cte-write'));
+    await runInDurableObject(stub, async (instance: CatoAgent, state: DurableObjectState) => {
+      const internals = instance as unknown as AgentInternals;
+      await internals.initialize();
+      state.storage.sql.exec('CREATE TABLE IF NOT EXISTS probe (v INTEGER)').toArray();
+      state.storage.sql.exec('INSERT INTO probe (v) VALUES (1)').toArray();
+
+      // WITH-prefixed full-table UPDATE: classifySQL sees 'write' (top-level verb
+      // is UPDATE), and isUnsafeWrite must catch the missing WHERE even though the
+      // first keyword is WITH. Same rejection path as a plain no-WHERE UPDATE.
+      const result = await internals.executeTool(
+        'write',
+        { sql: 'WITH x AS (SELECT 1) UPDATE probe SET v = 2', rationale: 'test' },
+        admin
+      );
+      expect(result).toContain('Unsafe operation rejected');
+      expect(result).toContain('WHERE');
+
+      // The row is untouched — the write never executed.
+      const rows = state.storage.sql.exec('SELECT v FROM probe').toArray();
+      expect(rows).toEqual([{ v: 1 }]);
     });
   });
 });

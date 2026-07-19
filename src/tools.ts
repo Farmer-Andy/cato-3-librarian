@@ -27,10 +27,15 @@ export function classifySQL(sql: string): SQLClass {
   return 'unknown';
 }
 
-// Find the first paren-depth-0 statement verb after the CTE definitions.
-// CTE bodies live inside parentheses, so the first top-level write/select
-// keyword is the statement the CTE feeds.
-function classifyCTE(stripped: string): SQLClass {
+// Find the top-level (paren-depth-0) statement verb a WITH prefix feeds, and its
+// offset in `stripped`. CTE bodies live inside parentheses, so tokens at depth > 0
+// are skipped; the first depth-0 statement keyword after the WITH prefix is the
+// real statement. Only stops on WRITE_KEYWORDS/SELECT/VALUES — never on a bare
+// identifier, because CTE names, `AS`, and comma-separated CTE headers all appear
+// at depth 0 between the WITH and the verb (`WITH a AS (…), b AS (…) SELECT …`).
+// Returns null if no such verb is found. Shared by classifyCTE and isUnsafeWrite
+// so both agree on where the statement actually begins.
+function topLevelStatementKeyword(stripped: string): { keyword: string; index: number } | null {
   let depth = 0;
   let sawWith = false;
   const re = /[()]|[A-Za-z_]+/g;
@@ -45,9 +50,19 @@ function classifyCTE(stripped: string): SQLClass {
       if (kw === 'WITH') sawWith = true;
       continue;
     }
-    if (WRITE_KEYWORDS.has(kw)) return 'write';
-    if (kw === 'SELECT' || kw === 'VALUES') return 'read';
+    if (WRITE_KEYWORDS.has(kw) || kw === 'SELECT' || kw === 'VALUES') {
+      return { keyword: kw, index: m.index };
+    }
   }
+  return null;
+}
+
+// Classify a WITH-prefixed statement by the verb the CTE feeds, not the WITH.
+function classifyCTE(stripped: string): SQLClass {
+  const top = topLevelStatementKeyword(stripped);
+  if (!top) return 'unknown';
+  if (WRITE_KEYWORDS.has(top.keyword)) return 'write';
+  if (top.keyword === 'SELECT' || top.keyword === 'VALUES') return 'read';
   return 'unknown';
 }
 
@@ -92,14 +107,37 @@ function classifyPragma(stripped: string): SQLClass {
     : 'unknown';
 }
 
+// True when a statement is a full-table UPDATE/DELETE (no WHERE) — the write
+// tool's last safety net against wiping a table.
+//
+// The guard is a WHERE *token* check, not a substring one: identifiers like
+// SOMEWHERE must not satisfy it. Two residual gaps are accepted here (both shared
+// with phase-2; structural SQL analysis is out of scope for a classifier):
+//   1. A tautological clause (WHERE id = id) still counts as constrained.
+//   2. A WHERE inside a subquery *after* the verb (e.g. in a SET clause,
+//      `UPDATE t SET c = (SELECT x FROM y WHERE …)`) still satisfies the check.
+// Both let a technically-unconstrained write through; neither is a full-table
+// wipe of the primary target in normal usage.
 export function isUnsafeWrite(sql: string): boolean {
   const stripped = stripCommentsAndStrings(sql).toUpperCase();
   const firstKeyword = extractFirstKeyword(stripped);
-  if (firstKeyword !== 'DELETE' && firstKeyword !== 'UPDATE') return false;
-  // Token check, not substring: identifiers like SOMEWHERE must not satisfy the guard.
-  // Known residual gap (shared with phase-2): a tautological clause like
-  // WHERE id = id still counts as constrained. Structural analysis is out of scope.
-  return !/\bWHERE\b/.test(stripped);
+  // Plain UPDATE/DELETE: check WHERE over the whole statement (unchanged behavior).
+  if (firstKeyword === 'DELETE' || firstKeyword === 'UPDATE') {
+    return !/\bWHERE\b/.test(stripped);
+  }
+  // CTE-wrapped write: `WITH … UPDATE/DELETE …` classifies as 'write' via
+  // classifyCTE, but the first keyword is WITH, so the plain check above skips it.
+  // Resolve the top-level verb and apply the same WHERE check from the verb
+  // onward. Slicing from the verb is essential: a WHERE inside a CTE body
+  // (`WITH x AS (SELECT 1 FROM t WHERE a=1) UPDATE big SET c=2`) constrains the
+  // CTE's SELECT, not the UPDATE, and must NOT satisfy the guard.
+  if (firstKeyword === 'WITH') {
+    const top = topLevelStatementKeyword(stripped);
+    if (top && (top.keyword === 'UPDATE' || top.keyword === 'DELETE')) {
+      return !/\bWHERE\b/.test(stripped.slice(top.index));
+    }
+  }
+  return false;
 }
 
 // --- Protected tables ---
