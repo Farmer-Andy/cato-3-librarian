@@ -308,6 +308,14 @@ export function getActiveModelOpenRouterId(sql: SqlStorage): { primary: string; 
   return { primary, fallback };
 }
 
+// Quote an identifier for interpolation into SQL/PRAGMA text: wrap in double
+// quotes and double any embedded quote. An approved DDL can create a legal but
+// unusual name (spaces, embedded quotes); the manifest generator runs during
+// initialize(), so an unquoted hostile name would throw and brick the DO's boot.
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
 export function generateSchemaManifest(sql: SqlStorage): string {
   const now = new Date().toISOString();
   const sqliteVersion = 'cf-do-sqlite';
@@ -336,7 +344,7 @@ export function generateSchemaManifest(sql: SqlStorage): string {
     lines.push(`Columns:`);
 
     // Get column info via PRAGMA
-    const cols = sql.exec(`PRAGMA table_info(${table})`).toArray() as Array<Record<string, unknown>>;
+    const cols = sql.exec(`PRAGMA table_info(${quoteIdent(table)})`).toArray() as Array<Record<string, unknown>>;
     for (const col of cols) {
       const name = String(col['name']);
       const type = String(col['type']);
@@ -348,13 +356,13 @@ export function generateSchemaManifest(sql: SqlStorage): string {
     }
 
     // Get indexes
-    const indexes = sql.exec(`PRAGMA index_list(${table})`).toArray() as Array<Record<string, unknown>>;
+    const indexes = sql.exec(`PRAGMA index_list(${quoteIdent(table)})`).toArray() as Array<Record<string, unknown>>;
     const userIndexes = indexes.filter(i => !String(i['name']).startsWith('sqlite_'));
     if (userIndexes.length > 0) {
       lines.push(`Indexes:`);
       for (const idx of userIndexes) {
         const idxName = String(idx['name']);
-        const idxCols = sql.exec(`PRAGMA index_info(${idxName})`).toArray() as Array<Record<string, unknown>>;
+        const idxCols = sql.exec(`PRAGMA index_info(${quoteIdent(idxName)})`).toArray() as Array<Record<string, unknown>>;
         const colList = idxCols.map(c => String(c['name'])).join(', ');
         lines.push(`- ${idxName} on (${colList})`);
       }
@@ -376,7 +384,7 @@ function getComment(sql: SqlStorage, kind: string, name: string): string | null 
 
 function getRowCount(sql: SqlStorage, table: string): number {
   try {
-    const rows = sql.exec(`SELECT COUNT(*) as n FROM "${table}"`).toArray();
+    const rows = sql.exec(`SELECT COUNT(*) as n FROM ${quoteIdent(table)}`).toArray();
     return rows.length > 0 ? Number((rows[0] as Record<string, unknown>)['n']) : 0;
   } catch {
     return -1;
