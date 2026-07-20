@@ -6,6 +6,8 @@ A deployable Cloudflare Workers + Durable Objects database agent. It owns its ow
 
 This repo is the **base template**. Clone it, customize two files, deploy. That is the full workflow.
 
+Built by [T. Andrew Barnes](https://thomasandrewbarnes.us/cato). The portfolio page tells the story of how this repo was designed, tested, and hardened before going public.
+
 ---
 
 ## Quickstart
