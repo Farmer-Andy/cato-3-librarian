@@ -426,6 +426,8 @@ The SQL classifier runs server-side. If the agent tries to call `query` with a `
 
 The `query` tier caps returned rows at 200, clips any single value longer than 2,000 characters, and stops at a 64KB output budget. It reads the result cursor and stops at the caps rather than materializing the whole result first, so a `SELECT *` on a huge table can't exhaust memory. A truncated result carries a note saying which limit was hit and telling the caller to add a `WHERE` filter or `LIMIT` to narrow it, which also keeps the model's context and token cost bounded.
 
+A successful `write` reports how many rows it actually changed (`Write executed successfully (3 rows modified).`); a write that matches nothing returns `WARNING: write executed but modified 0 rows`, telling the agent not to report the operation as done and to re-check with a fresh query first. The count is the logical affected-row count from `SELECT changes()`, so an `UPDATE` whose `WHERE` matched no rows, or an `INSERT` whose conflict clause skipped every row, surfaces as a 0-row write instead of a silent success. That closes a failure mode where the agent would otherwise narrate a fabricated write (an `UPDATE` against a made-up id) as completed.
+
 Two known limits on the `WHERE` requirement for `UPDATE`/`DELETE`, which applies to the statement's top-level verb (CTE-wrapped writes included): the check confirms a `WHERE` token is present, not that it constrains anything, so `DELETE FROM t WHERE id = id` passes the guard and clears the table; and a `WHERE` inside a subquery after the verb (say, in a `SET` clause) also satisfies it. Whole-table protection here is about preventing accidents, not adversarial SQL. The same is true of the classifier as a whole: it is a keyword-level policy, not a SQL parser. If your deployment needs authority narrower than "any write to a non-protected table," replace the free-form `write` tool with typed domain tools in your derived deployment and protect the domain tables too. That derivation pattern is the recommended path for anything user-facing.
 
 ---
@@ -433,6 +435,7 @@ Two known limits on the `WHERE` requirement for `UPDATE`/`DELETE`, which applies
 ## Known Gotchas
 
 - **CF DO SQLite requires `.toArray()` on every `sql.exec()` call.** Cursors are lazy. Omitting it means DDL statements silently do not execute in production.
+- **`cursor.rowsWritten` overcounts on indexed tables.** It counts index-entry writes too, so a single-row `INSERT` into a table with one secondary index reports 2, and a 3-row `UPDATE` reports 6. Use `SELECT changes()` for the logical affected-row count, which is what the `write` tool reports.
 - **`sqlite_version()` is blocked** in Cloudflare DO SQLite. The manifest reports `cf-do-sqlite` as the version string.
 - **`LIKE '__%'` is a wildcard trap.** The `_` in SQL LIKE matches any single character. Use `substr(name, 1, 2) != '__'` instead of `name NOT LIKE '__%'` when filtering internal table prefixes.
 - **Table name prefix `_cf_` is reserved** by Cloudflare. Do not use it for your tables.
