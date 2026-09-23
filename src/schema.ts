@@ -189,7 +189,7 @@ export function populateMetaComments(sql: SqlStorage): void {
     // model_registry
     ['table', 'model_registry', 'Registered OpenRouter models available for use.'],
     ['column', 'model_registry.slug', 'Human-readable identifier, e.g. mimo-pro.'],
-    ['column', 'model_registry.openrouter_id', 'Full OpenRouter model string, e.g. xiaomi/mimo-v2.5-pro.'],
+    ['column', 'model_registry.openrouter_id', 'Full OpenRouter model string, e.g. xiaomi/mimo-v2.6-pro.'],
     ['column', 'model_registry.role', 'primary | fallback | eval | disabled'],
     ['column', 'model_registry.notes', 'Optional notes about the model.'],
     ['column', 'model_registry.added_at', 'When this model was registered.'],
@@ -255,7 +255,7 @@ export function populateMetaComments(sql: SqlStorage): void {
 
 export function seedModelRegistry(sql: SqlStorage): void {
   const models = [
-    { slug: 'mimo-pro', id: 'xiaomi/mimo-v2.5-pro', role: 'primary', notes: 'Default primary' },
+    { slug: 'mimo-pro', id: 'xiaomi/mimo-v2.6-pro', role: 'primary', notes: 'Default primary' },
     { slug: 'minimax-m3', id: 'minimax/minimax-m3', role: 'fallback', notes: 'Default fallback' },
   ];
 
@@ -282,7 +282,7 @@ interface ActiveModelRow {
 
 export function getActiveModel(sql: SqlStorage): ActiveModelRow {
   const rows = sql.exec(`SELECT primary_slug, fallback_slug FROM active_model WHERE singleton = 1`).toArray();
-  if (rows.length === 0) return { primary_slug: 'xiaomi/mimo-v2.5-pro', fallback_slug: null };
+  if (rows.length === 0) return { primary_slug: 'xiaomi/mimo-v2.6-pro', fallback_slug: null };
   const row = rows[0] as Record<string, unknown>;
   return {
     primary_slug: row['primary_slug'] as string,

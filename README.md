@@ -170,7 +170,7 @@ Write these the way you would brief a new teammate: state the enum values, the i
 
 #### Optionally swap the default models in `seedModelRegistry()`
 
-The template seeds `xiaomi/mimo-v2.5-pro` as primary and `minimax/minimax-m3` as fallback. Replace these with any [OpenRouter](https://openrouter.ai/models) model IDs you prefer:
+The template seeds `xiaomi/mimo-v2.6-pro` as primary and `minimax/minimax-m3` as fallback. Replace these with any [OpenRouter](https://openrouter.ai/models) model IDs you prefer. The seed is `INSERT OR IGNORE`, so on an instance that already booted, changing it does not touch the existing row: update it with SQL (`UPDATE model_registry SET openrouter_id = ... WHERE slug = ...`).
 
 ```typescript
 const models = [
